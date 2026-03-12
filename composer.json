@@ -1,0 +1,42 @@
+{
+    "name": "pablocarvalho/laravel-sqs-telemetry",
+    "description": "A Laravel SDK for sending exception and request telemetry to AWS SQS asynchronously with batching and memory buffer.",
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Pablo Carvalho",
+            "email": "pablo@example.com"
+        }
+    ],
+    "require": {
+        "php": "^7.4 || ^8.0",
+        "illuminate/support": "^8.0 || ^9.0 || ^10.0 || ^11.0",
+        "illuminate/http": "^8.0 || ^9.0 || ^10.0 || ^11.0",
+        "illuminate/contracts": "^8.0 || ^9.0 || ^10.0 || ^11.0",
+        "aws/aws-sdk-php": "^3.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Pablocarvalho\\SqsTelemetry\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Pablocarvalho\\SqsTelemetry\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Pablocarvalho\\SqsTelemetry\\SqsTelemetryServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "require-dev": {
+        "orchestra/testbench": "^6.0 || ^7.0 || ^8.0 || ^9.0",
+        "phpunit/phpunit": "^9.0 || ^10.0"
+    }
+}

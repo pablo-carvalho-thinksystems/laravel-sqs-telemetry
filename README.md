@@ -44,18 +44,52 @@ php artisan vendor:publish --tag=sqs-telemetry-config
 Em seguida, adicione as variáveis necessárias ao seu arquivo `.env`:
 ```env
 SQS_TELEMETRY_ENABLED=true
-SQS_TELEMETRY_QUEUE_URL="https://sqs.us-east-1.amazonaws.com/000000000/sua-fila"
+SQS_TELEMETRY_QUEUE_URL="https://sqs.us-east-1.amazonaws.com/123456789012/my-telemetry-queue"
+AWS_ACCESS_KEY_ID="your-key"
+AWS_SECRET_ACCESS_KEY="your-secret"
+AWS_DEFAULT_REGION="us-east-1"
 SQS_TELEMETRY_BATCH_SIZE=10
 
-# Opcional: Defina credenciais da AWS se forem diferentes das credenciais padrão do seu servidor
-# AWS_ACCESS_KEY_ID=
-# AWS_SECRET_ACCESS_KEY=
-# AWS_DEFAULT_REGION=us-east-1
+# AI Configs (Opcional - Requer OpenAI Key)
+SQS_TELEMETRY_AI_ENABLED=true
+SQS_TELEMETRY_AI_API_KEY="sk-..."
 ```
 
 ## Uso
 
 Você tem dois componentes principais à sua disposição: O *Middleware* de rastreamento HTTP e o *Exception handler* para captar os erros não tratados.
+
+### O que é capturado?
+
+### Request (Middleware)
+- `url`
+- `method`
+- `ip`
+- `user_agent`
+- `status_code`
+- `execution_time` (em ms)
+- `timestamp`
+- `headers`
+- `payload` (senhas e tokens são substituídos por `********`)
+
+### Exceptions (Handler)
+- `class`
+- `message`
+- `file`
+- `line`
+- `url` (se via HTTP)
+- `method`
+- `timestamp`
+- `headers` e `payload`
+- `stack_trace` (limitado a 10 linhas)
+- `ai_resolution_report` (detalhes sobre a causa e resolução da falha caso o módulo de IA esteja ativado)
+
+## Análise de Exceções por Inteligência Artificial
+
+A aplicação integra a API da OpenAI para gerar resoluções detalhadas (Code Scan e context injection).
+Se você habilitar, a varredura buscará a linha exata no seu código local (`app/`, etc.) de onde o stacktrace alertou o erro, obtendo linhas de antes e de depois, enviando as para a IA e gerando orientações em Markdown para facilitar a resolução dentro do seu Client / Relatórios.
+
+**Aviso:** Processar via IA adicionará um tempo extra (~1-5 segundos) para a exceção ser consolidada e enviada via SQS, afetando a performance final da resposta no erro no ambiente em que estiver rodando on demand.
 
 ### 1. Rastreamento de Requisições HTTP (Middleware)
 

@@ -49,4 +49,22 @@ return [
     |
     */
     'batch_size' => env('SQS_TELEMETRY_BATCH_SIZE', 10),
+
+    /*
+    |--------------------------------------------------------------------------
+    | AI Exception Analyzer
+    |--------------------------------------------------------------------------
+    |
+    | When enabled, the package will send the exception trace and code context
+    | to an AI provider (default OpenAI) to generate a resolution report.
+    | Note: This happens synchronously and may add delay to the response.
+    |
+    */
+    'ai' => [
+        'enabled'  => env('SQS_TELEMETRY_AI_ENABLED', false),
+        'provider' => env('SQS_TELEMETRY_AI_PROVIDER', 'openai'),
+        'model'    => env('SQS_TELEMETRY_AI_MODEL', 'gpt-4o-mini'),
+        'api_key'  => env('SQS_TELEMETRY_AI_API_KEY', ''),
+        'api_url'  => env('SQS_TELEMETRY_AI_API_URL', 'https://api.openai.com/v1/chat/completions'),
+    ],
 ];

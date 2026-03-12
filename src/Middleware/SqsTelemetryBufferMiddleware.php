@@ -46,6 +46,7 @@ class SqsTelemetryBufferMiddleware
                 'status_code'    => $response->getStatusCode(),
                 'execution_time' => $executionTime,
                 'timestamp'      => now()->toIso8601String(),
+                'payload'        => $this->filterPayload($request->all()),
                 'headers'        => $this->filterHeaders($request->headers->all()),
             ]);
         }
@@ -72,5 +73,24 @@ class SqsTelemetryBufferMiddleware
         return array_map(function ($value) {
             return is_array($value) ? implode(', ', $value) : $value;
         }, $headers);
+    }
+
+    /**
+     * Filters out sensitive payload data (like passwords).
+     *
+     * @param array $payload
+     * @return array
+     */
+    protected function filterPayload(array $payload): array
+    {
+        $sensitive = ['password', 'password_confirmation', 'token', 'secret', 'authorization'];
+
+        foreach ($sensitive as $key) {
+            if (isset($payload[$key])) {
+                $payload[$key] = '********';
+            }
+        }
+
+        return $payload;
     }
 }

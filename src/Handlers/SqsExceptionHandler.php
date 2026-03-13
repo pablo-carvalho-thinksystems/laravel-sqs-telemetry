@@ -59,6 +59,7 @@ class SqsExceptionHandler
             }
 
             $this->buffer->addException([
+                'project'     => config('sqs-telemetry.project', 'laravel-app'),
                 'class'       => get_class($e),
                 'message'     => utf8_encode((string)$e->getMessage()),
                 'file'        => $e->getFile(),

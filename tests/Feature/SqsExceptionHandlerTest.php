@@ -14,7 +14,10 @@ class SqsExceptionHandlerTest extends TestCase
 {
     public function test_handler_adds_exception_to_buffer()
     {
-        config(['sqs-telemetry.enabled' => true]);
+        config([
+            'sqs-telemetry.enabled' => true,
+            'sqs-telemetry.project' => 'test-project',
+        ]);
         
         $bufferMock = Mockery::mock(SqsBuffer::class);
         $fetcherMock = Mockery::mock(CodeContextFetcher::class);
@@ -24,7 +27,8 @@ class SqsExceptionHandlerTest extends TestCase
         $aiMock->shouldReceive('isEnabled')->andReturn(false);
 
         $bufferMock->shouldReceive('addException')->once()->with(Mockery::on(function ($data) {
-            return $data['class'] === Exception::class
+            return $data['project'] === 'test-project'
+                && $data['class'] === Exception::class
                 && $data['message'] === 'Test Exception'
                 && isset($data['stack_trace'])
                 && array_key_exists('ai_resolution_report', $data)
@@ -51,7 +55,10 @@ class SqsExceptionHandlerTest extends TestCase
 
     public function test_handler_includes_ai_report_when_enabled()
     {
-        config(['sqs-telemetry.enabled' => true]);
+        config([
+            'sqs-telemetry.enabled' => true,
+            'sqs-telemetry.project' => 'test-project',
+        ]);
         
         $bufferMock = Mockery::mock(SqsBuffer::class);
         $fetcherMock = Mockery::mock(CodeContextFetcher::class);
@@ -65,7 +72,8 @@ class SqsExceptionHandlerTest extends TestCase
         $aiMock->shouldReceive('generateReport')->with($e, $context)->andReturn('Mocked AI Report Markdown');
 
         $bufferMock->shouldReceive('addException')->once()->with(Mockery::on(function ($data) {
-            return $data['class'] === Exception::class
+            return $data['project'] === 'test-project'
+                && $data['class'] === Exception::class
                 && $data['message'] === 'AI Test Exception'
                 && $data['ai_resolution_report'] === 'Mocked AI Report Markdown';
         }));

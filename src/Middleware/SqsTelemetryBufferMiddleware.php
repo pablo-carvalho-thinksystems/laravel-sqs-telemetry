@@ -39,6 +39,7 @@ class SqsTelemetryBufferMiddleware
             $executionTime = round((microtime(true) - $startTime) * 1000, 2); // ms
 
             $this->buffer->addRequest([
+                'project'        => config('sqs-telemetry.project', 'laravel-app'),
                 'url'            => $request->fullUrl(),
                 'method'         => $request->method(),
                 'ip'             => $request->ip(),

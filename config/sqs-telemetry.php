@@ -14,6 +14,17 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Project Identifier
+    |--------------------------------------------------------------------------
+    |
+    | Identifier for the project sending telemetry data.
+    | Useful for filtering or identifying data in SQS.
+    |
+    */
+    'project' => env('SQS_TELEMETRY_PROJECT', env('APP_NAME', 'laravel-app')),
+
+    /*
+    |--------------------------------------------------------------------------
     | AWS Credentials & Region
     |--------------------------------------------------------------------------
     |

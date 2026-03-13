@@ -14,11 +14,15 @@ class SqsTelemetryBufferMiddlewareTest extends TestCase
     public function test_middleware_adds_request_to_buffer()
     {
         // Force config to true just in case
-        config(['sqs-telemetry.enabled' => true]);
+        config([
+            'sqs-telemetry.enabled' => true,
+            'sqs-telemetry.project' => 'test-project',
+        ]);
 
         $bufferMock = Mockery::mock(SqsBuffer::class);
         $bufferMock->shouldReceive('addRequest')->once()->with(Mockery::on(function ($data) {
-            return $data['url'] === 'http://localhost/test'
+            return $data['project'] === 'test-project'
+                && $data['url'] === 'http://localhost/test'
                 && $data['method'] === 'GET'
                 && $data['status_code'] === 200
                 && isset($data['execution_time'])
@@ -53,11 +57,15 @@ class SqsTelemetryBufferMiddlewareTest extends TestCase
 
     public function test_middleware_filters_sensitive_headers()
     {
-        config(['sqs-telemetry.enabled' => true]);
+        config([
+            'sqs-telemetry.enabled' => true,
+            'sqs-telemetry.project' => 'test-project',
+        ]);
 
         $bufferMock = Mockery::mock(SqsBuffer::class);
         $bufferMock->shouldReceive('addRequest')->once()->with(Mockery::on(function ($data) {
-            return !isset($data['headers']['authorization'])
+            return $data['project'] === 'test-project'
+                && !isset($data['headers']['authorization'])
                 && !isset($data['headers']['cookie'])
                 && isset($data['headers']['x-custom-header']);
         }));

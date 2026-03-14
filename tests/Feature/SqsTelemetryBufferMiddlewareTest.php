@@ -7,6 +7,7 @@ use Illuminate\Http\Response;
 use Mockery;
 use Pablocarvalho\SqsTelemetry\Middleware\SqsTelemetryBufferMiddleware;
 use Pablocarvalho\SqsTelemetry\Services\SqsBuffer;
+use Pablocarvalho\SqsTelemetry\Services\TimelineContext;
 use Pablocarvalho\SqsTelemetry\Tests\TestCase;
 
 class SqsTelemetryBufferMiddlewareTest extends TestCase
@@ -29,7 +30,12 @@ class SqsTelemetryBufferMiddlewareTest extends TestCase
                 && isset($data['headers']);
         }));
 
-        $middleware = new SqsTelemetryBufferMiddleware($bufferMock);
+        $timelineMock = Mockery::mock(TimelineContext::class);
+        $timelineMock->shouldReceive('startRequest')->once();
+        $timelineMock->shouldReceive('addEvent')->once();
+        $timelineMock->shouldReceive('getTimeline')->once()->andReturn([]);
+
+        $middleware = new SqsTelemetryBufferMiddleware($bufferMock, $timelineMock);
 
         $request = Request::create('http://localhost/test', 'GET');
         
@@ -47,7 +53,10 @@ class SqsTelemetryBufferMiddlewareTest extends TestCase
         $bufferMock = Mockery::mock(SqsBuffer::class);
         $bufferMock->shouldReceive('addRequest')->never();
 
-        $middleware = new SqsTelemetryBufferMiddleware($bufferMock);
+        $timelineMock = Mockery::mock(TimelineContext::class);
+        $timelineMock->shouldReceive('startRequest')->once();
+
+        $middleware = new SqsTelemetryBufferMiddleware($bufferMock, $timelineMock);
         $request = Request::create('http://localhost/test', 'GET');
         
         $middleware->handle($request, function ($req) {
@@ -70,7 +79,12 @@ class SqsTelemetryBufferMiddlewareTest extends TestCase
                 && isset($data['headers']['x-custom-header']);
         }));
 
-        $middleware = new SqsTelemetryBufferMiddleware($bufferMock);
+        $timelineMock = Mockery::mock(TimelineContext::class);
+        $timelineMock->shouldReceive('startRequest')->once();
+        $timelineMock->shouldReceive('addEvent')->once();
+        $timelineMock->shouldReceive('getTimeline')->once()->andReturn([]);
+
+        $middleware = new SqsTelemetryBufferMiddleware($bufferMock, $timelineMock);
 
         $request = Request::create('http://localhost/test', 'GET');
         $request->headers->set('Authorization', 'Bearer secret123');

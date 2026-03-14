@@ -7,6 +7,7 @@ namespace Pablocarvalho\SqsTelemetry\Middleware;
 use Closure;
 use Illuminate\Http\Request;
 use Pablocarvalho\SqsTelemetry\Services\SqsBuffer;
+use Pablocarvalho\SqsTelemetry\Services\TimelineContext;
 use Symfony\Component\HttpFoundation\Response;
 
 class SqsTelemetryBufferMiddleware
@@ -16,9 +17,15 @@ class SqsTelemetryBufferMiddleware
      */
     protected $buffer;
 
-    public function __construct(SqsBuffer $buffer)
+    /**
+     * @var TimelineContext
+     */
+    protected $timelineContext;
+
+    public function __construct(SqsBuffer $buffer, TimelineContext $timelineContext)
     {
         $this->buffer = $buffer;
+        $this->timelineContext = $timelineContext;
     }
 
     /**
@@ -30,6 +37,9 @@ class SqsTelemetryBufferMiddleware
      */
     public function handle(Request $request, Closure $next)
     {
+        // Start the timeline recording
+        $this->timelineContext->startRequest();
+
         $startTime = microtime(true);
 
         /** @var Response $response */
@@ -37,6 +47,11 @@ class SqsTelemetryBufferMiddleware
 
         if (config('sqs-telemetry.enabled', true)) {
             $executionTime = round((microtime(true) - $startTime) * 1000, 2); // ms
+
+            // Add an explicit response event to the timeline before sending
+            $this->timelineContext->addEvent('response_sent', 'HTTP Response Sent', 0.0, [
+                'status_code' => $response->getStatusCode(),
+            ]);
 
             $this->buffer->addRequest([
                 'project'        => config('sqs-telemetry.project', 'laravel-app'),
@@ -49,6 +64,7 @@ class SqsTelemetryBufferMiddleware
                 'timestamp'      => now()->toIso8601String(),
                 'payload'        => $this->filterPayload($request->all()),
                 'headers'        => $this->filterHeaders($request->headers->all()),
+                'timeline'       => $this->timelineContext->getTimeline(),
             ]);
         }
 

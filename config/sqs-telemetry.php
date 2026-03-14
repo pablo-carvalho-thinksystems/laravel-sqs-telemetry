@@ -78,4 +78,19 @@ return [
         'api_key'  => env('SQS_TELEMETRY_AI_API_KEY', ''),
         'api_url'  => env('SQS_TELEMETRY_AI_API_URL', 'https://api.openai.com/v1/chat/completions'),
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Timeline Telemetry
+    |--------------------------------------------------------------------------
+    |
+    | Configuration for capturing the request timeline (execution times).
+    | You can enable or disable specific types of timeline events.
+    |
+    */
+    'timeline' => [
+        'db'    => env('SQS_TELEMETRY_TIMELINE_DB', true),
+        'http'  => env('SQS_TELEMETRY_TIMELINE_HTTP', true),
+        'cache' => env('SQS_TELEMETRY_TIMELINE_CACHE', true),
+    ],
 ];

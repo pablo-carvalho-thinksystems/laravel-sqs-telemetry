@@ -94,12 +94,14 @@ class SqsTelemetryServiceProvider extends ServiceProvider
             $this->app['events']->listen(QueryExecuted::class, function (QueryExecuted $event) use ($timelineContext) {
                 // Determine connection name if available
                 $connectionName = $event->connectionName ?? 'default';
-                
-                $timelineContext->addEvent('db_query', $event->sql, $event->time, [
-                    'connection' => $connectionName,
-                    // Keep bindings out by default to avoid sensitive data leakage, or serialize them safely.
-                    // 'bindings' => $event->bindings, 
-                ]);
+
+                $metadata = ['connection' => $connectionName];
+
+                if (config('sqs-telemetry.timeline.db_bindings', true)) {
+                    $metadata['bindings'] = $this->sanitizeBindings($event->sql, $event->bindings);
+                }
+
+                $timelineContext->addEvent('db_query', $event->sql, $event->time, $metadata);
             });
         }
 
@@ -149,6 +151,44 @@ class SqsTelemetryServiceProvider extends ServiceProvider
                 $timelineContext->addEvent('cache_forget', "Cache forget: {$event->key}", 0.0);
             });
         }
+    }
+
+    /**
+     * Sanitize query bindings by redacting values for sensitive columns.
+     *
+     * @param string $sql
+     * @param array $bindings
+     * @return array
+     */
+    protected function sanitizeBindings(string $sql, array $bindings): array
+    {
+        $sensitivePattern = '/password|secret|token|api_key|cpf|cnpj/i';
+
+        // Try to extract column names from INSERT statements to match with bindings
+        if (preg_match('/\(([^)]+)\)\s*values/i', $sql, $matches)) {
+            $columns = array_map('trim', explode(',', str_replace('"', '', $matches[1])));
+
+            foreach ($bindings as $index => $value) {
+                if (isset($columns[$index]) && preg_match($sensitivePattern, $columns[$index])) {
+                    $bindings[$index] = '[REDACTED]';
+                }
+            }
+        }
+
+        // Also check for UPDATE SET assignments: SET column = ?
+        if (preg_match_all('/([\w"]+)\s*=\s*\?/i', $sql, $matches)) {
+            $columns = array_map(function ($col) {
+                return trim(str_replace('"', '', $col));
+            }, $matches[1]);
+
+            foreach ($columns as $index => $column) {
+                if (isset($bindings[$index]) && preg_match($sensitivePattern, $column)) {
+                    $bindings[$index] = '[REDACTED]';
+                }
+            }
+        }
+
+        return $bindings;
     }
 
     /**

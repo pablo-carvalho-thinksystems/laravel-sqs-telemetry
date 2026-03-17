@@ -55,6 +55,17 @@ class SqsBuffer
     }
 
     /**
+     * Adds a command telemetry entry to the buffer.
+     *
+     * @param array $data
+     * @return void
+     */
+    public function addCommand(array $data): void
+    {
+        $this->messages[] = array_merge(['type' => 'command'], $data);
+    }
+
+    /**
      * Flushes all buffered messages to SQS in batches.
      * This is useful for `app()->terminating()` and prevents memory leaks in Octane.
      *

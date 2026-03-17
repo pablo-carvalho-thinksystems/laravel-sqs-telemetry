@@ -4,10 +4,13 @@ declare(strict_types=1);
 
 namespace Pablocarvalho\SqsTelemetry;
 
+use Illuminate\Console\Events\CommandFinished;
+use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Http\Client\Events\ConnectionFailed;
 use Illuminate\Http\Client\Events\ResponseReceived;
 use Illuminate\Support\ServiceProvider;
+use Pablocarvalho\SqsTelemetry\Listeners\SqsCommandListener;
 use Pablocarvalho\SqsTelemetry\Services\SqsBuffer;
 use Pablocarvalho\SqsTelemetry\Services\SqsClientService;
 use Pablocarvalho\SqsTelemetry\Services\TimelineContext;
@@ -58,6 +61,9 @@ class SqsTelemetryServiceProvider extends ServiceProvider
 
         // Register Timeline Listeners
         $this->registerTimelineListeners();
+
+        // Register Command Listeners
+        $this->registerCommandListeners();
 
         // The Magic Happens Here:
         // By hooking into the terminating event, we ensure that the buffer flush
@@ -143,5 +149,25 @@ class SqsTelemetryServiceProvider extends ServiceProvider
                 $timelineContext->addEvent('cache_forget', "Cache forget: {$event->key}", 0.0);
             });
         }
+    }
+
+    /**
+     * Register listeners for Artisan command events if enabled in config.
+     *
+     * @return void
+     */
+    protected function registerCommandListeners(): void
+    {
+        if (!config('sqs-telemetry.timeline.commands', true)) {
+            return;
+        }
+
+        $listener = new SqsCommandListener(
+            $this->app->make(SqsBuffer::class),
+            $this->app->make(TimelineContext::class)
+        );
+
+        $this->app['events']->listen(CommandStarting::class, [$listener, 'handleStarting']);
+        $this->app['events']->listen(CommandFinished::class, [$listener, 'handleFinished']);
     }
 }

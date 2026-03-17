@@ -92,10 +92,14 @@ class SqsTelemetryServiceProvider extends ServiceProvider
         // Database Queries
         if (config('sqs-telemetry.timeline.db', true)) {
             $this->app['events']->listen(QueryExecuted::class, function (QueryExecuted $event) use ($timelineContext) {
-                // Determine connection name if available
+                // Determine connection name and database if available
                 $connectionName = $event->connectionName ?? 'default';
+                $database = $event->connection->getDatabaseName();
 
-                $metadata = ['connection' => $connectionName];
+                $metadata = [
+                    'connection' => $connectionName,
+                    'database'   => $database,
+                ];
 
                 if (config('sqs-telemetry.timeline.db_bindings', true)) {
                     $metadata['bindings'] = $this->sanitizeBindings($event->sql, $event->bindings);

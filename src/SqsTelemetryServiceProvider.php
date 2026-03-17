@@ -9,11 +9,14 @@ use Illuminate\Console\Events\CommandStarting;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Http\Client\Events\ConnectionFailed;
 use Illuminate\Http\Client\Events\ResponseReceived;
+use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\ServiceProvider;
+use Pablocarvalho\SqsTelemetry\Handlers\SqsExceptionHandler;
 use Pablocarvalho\SqsTelemetry\Listeners\SqsCommandListener;
 use Pablocarvalho\SqsTelemetry\Services\SqsBuffer;
 use Pablocarvalho\SqsTelemetry\Services\SqsClientService;
 use Pablocarvalho\SqsTelemetry\Services\TimelineContext;
+use Throwable;
 
 class SqsTelemetryServiceProvider extends ServiceProvider
 {
@@ -153,6 +156,57 @@ class SqsTelemetryServiceProvider extends ServiceProvider
             });
             $this->app['events']->listen(\Illuminate\Cache\Events\KeyForgotten::class, function ($event) use ($timelineContext) {
                 $timelineContext->addEvent('cache_forget', "Cache forget: {$event->key}", 0.0);
+            });
+        }
+
+        // Exceptions (captured from logs - catches handled exceptions too)
+        if (config('sqs-telemetry.timeline.exceptions', true)) {
+            $buffer = $this->app->make(SqsBuffer::class);
+            $reportedExceptions = [];
+
+            $this->app['events']->listen(MessageLogged::class, function (MessageLogged $event) use ($timelineContext, $buffer, &$reportedExceptions) {
+                if (!isset($event->context['exception']) || !($event->context['exception'] instanceof Throwable)) {
+                    return;
+                }
+
+                $exception = $event->context['exception'];
+                $hash = spl_object_hash($exception);
+
+                // Avoid reporting the same exception instance twice
+                if (isset($reportedExceptions[$hash])) {
+                    return;
+                }
+                $reportedExceptions[$hash] = true;
+
+                // Add to timeline
+                $timelineContext->addEvent('exception', get_class($exception) . ': ' . $exception->getMessage(), 0.0, [
+                    'class'   => get_class($exception),
+                    'message' => $exception->getMessage(),
+                    'file'    => $exception->getFile(),
+                    'line'    => $exception->getLine(),
+                    'handled' => true,
+                ]);
+
+                // Also send as a standalone exception entry
+                try {
+                    $request = request();
+
+                    $buffer->addException([
+                        'project'     => config('sqs-telemetry.project', 'laravel-app'),
+                        'class'       => get_class($exception),
+                        'message'     => $exception->getMessage(),
+                        'file'        => $exception->getFile(),
+                        'line'        => $exception->getLine(),
+                        'url'         => $request ? $request->fullUrl() : 'Console/Cli',
+                        'method'      => $request ? $request->method() : null,
+                        'timestamp'   => now()->toIso8601String(),
+                        'handled'     => true,
+                        'log_level'   => $event->level,
+                        'stack_trace' => implode("\n", array_slice(explode("\n", $exception->getTraceAsString()), 0, 10)),
+                    ]);
+                } catch (Throwable $e) {
+                    // Silently fail to avoid infinite loops
+                }
             });
         }
     }

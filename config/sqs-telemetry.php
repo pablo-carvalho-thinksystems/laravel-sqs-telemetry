@@ -95,5 +95,6 @@ return [
         'cache'       => env('SQS_TELEMETRY_TIMELINE_CACHE', true),
         'commands'    => env('SQS_TELEMETRY_TIMELINE_COMMANDS', true),
         'exceptions'  => env('SQS_TELEMETRY_TIMELINE_EXCEPTIONS', true),
+        'logs'        => env('SQS_TELEMETRY_TIMELINE_LOGS', true),
     ],
 ];

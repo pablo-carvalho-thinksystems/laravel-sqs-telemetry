@@ -66,6 +66,17 @@ class SqsBuffer
     }
 
     /**
+     * Adds a log telemetry entry to the buffer.
+     *
+     * @param array $data
+     * @return void
+     */
+    public function addLog(array $data): void
+    {
+        $this->messages[] = array_merge(['type' => 'log'], $data);
+    }
+
+    /**
      * Flushes all buffered messages to SQS in batches.
      * This is useful for `app()->terminating()` and prevents memory leaks in Octane.
      *

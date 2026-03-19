@@ -123,6 +123,11 @@ class SqsCommandListener
                 'timestamp'      => now()->toIso8601String(),
                 'timeline'       => $this->timelineContext->getTimeline(),
             ]);
+
+            // Flush immediately — in older Laravel versions (e.g., 6.x),
+            // app()->terminating() may not reliably fire in console context.
+            $this->buffer->flush();
+            $this->timelineContext->flush();
         } catch (Throwable $e) {
             Log::error('SqsTelemetry: Failed to report command telemetry.', [
                 'error'   => $e->getMessage(),

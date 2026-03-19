@@ -19,7 +19,12 @@ class SqsCommandListenerTest extends TestCase
 {
     public function test_it_captures_command_telemetry()
     {
+        $sentBatch = null;
         $sqsClientMock = Mockery::mock(SqsClientService::class);
+        $sqsClientMock->shouldReceive('sendBatch')->once()->withArgs(function ($batch) use (&$sentBatch) {
+            $sentBatch = $batch;
+            return true;
+        });
         $buffer = new SqsBuffer($sqsClientMock);
         $timelineContext = new TimelineContext();
 
@@ -42,21 +47,18 @@ class SqsCommandListenerTest extends TestCase
         );
         $listener->handleFinished($finishedEvent);
 
-        // Check that the buffer received a command entry
-        $reflection = new \ReflectionClass($buffer);
-        $property = $reflection->getProperty('messages');
-        $messages = $property->getValue($buffer);
-
-        $this->assertCount(1, $messages);
-        $this->assertEquals('command', $messages[0]['type']);
-        $this->assertEquals('inspire', $messages[0]['command']);
-        $this->assertEquals(0, $messages[0]['exit_code']);
-        $this->assertArrayHasKey('execution_time', $messages[0]);
-        $this->assertArrayHasKey('timeline', $messages[0]);
-        $this->assertIsArray($messages[0]['timeline']);
+        // Verify the batch sent to SQS
+        $this->assertNotNull($sentBatch);
+        $this->assertCount(1, $sentBatch);
+        $this->assertEquals('command', $sentBatch[0]['type']);
+        $this->assertEquals('inspire', $sentBatch[0]['command']);
+        $this->assertEquals(0, $sentBatch[0]['exit_code']);
+        $this->assertArrayHasKey('execution_time', $sentBatch[0]);
+        $this->assertArrayHasKey('timeline', $sentBatch[0]);
+        $this->assertIsArray($sentBatch[0]['timeline']);
 
         // Timeline should have: request_start, command_start, command_finished
-        $timeline = $messages[0]['timeline'];
+        $timeline = $sentBatch[0]['timeline'];
         $this->assertCount(3, $timeline);
         $this->assertEquals('request_start', $timeline[0]['type']);
         $this->assertEquals('command_start', $timeline[1]['type']);
@@ -66,6 +68,7 @@ class SqsCommandListenerTest extends TestCase
     public function test_it_ignores_excluded_commands()
     {
         $sqsClientMock = Mockery::mock(SqsClientService::class);
+        $sqsClientMock->shouldNotReceive('sendBatch');
         $buffer = new SqsBuffer($sqsClientMock);
         $timelineContext = new TimelineContext();
 
@@ -97,7 +100,12 @@ class SqsCommandListenerTest extends TestCase
 
     public function test_it_captures_timeline_events_during_command()
     {
+        $sentBatch = null;
         $sqsClientMock = Mockery::mock(SqsClientService::class);
+        $sqsClientMock->shouldReceive('sendBatch')->once()->withArgs(function ($batch) use (&$sentBatch) {
+            $sentBatch = $batch;
+            return true;
+        });
         $buffer = new SqsBuffer($sqsClientMock);
         $timelineContext = new TimelineContext();
 
@@ -124,13 +132,10 @@ class SqsCommandListenerTest extends TestCase
         );
         $listener->handleFinished($finishedEvent);
 
-        // Check that timeline includes the intermediate events
-        $reflection = new \ReflectionClass($buffer);
-        $property = $reflection->getProperty('messages');
-        $messages = $property->getValue($buffer);
-
-        $this->assertCount(1, $messages);
-        $timeline = $messages[0]['timeline'];
+        // Verify the batch sent to SQS
+        $this->assertNotNull($sentBatch);
+        $this->assertCount(1, $sentBatch);
+        $timeline = $sentBatch[0]['timeline'];
 
         // request_start, command_start, db_query, http_request, command_finished
         $this->assertCount(5, $timeline);
@@ -140,7 +145,12 @@ class SqsCommandListenerTest extends TestCase
 
     public function test_it_captures_failed_command_exit_code()
     {
+        $sentBatch = null;
         $sqsClientMock = Mockery::mock(SqsClientService::class);
+        $sqsClientMock->shouldReceive('sendBatch')->once()->withArgs(function ($batch) use (&$sentBatch) {
+            $sentBatch = $batch;
+            return true;
+        });
         $buffer = new SqsBuffer($sqsClientMock);
         $timelineContext = new TimelineContext();
 
@@ -161,11 +171,9 @@ class SqsCommandListenerTest extends TestCase
         );
         $listener->handleFinished($finishedEvent);
 
-        $reflection = new \ReflectionClass($buffer);
-        $property = $reflection->getProperty('messages');
-        $messages = $property->getValue($buffer);
-
-        $this->assertCount(1, $messages);
-        $this->assertEquals(1, $messages[0]['exit_code']);
+        // Verify the batch sent to SQS
+        $this->assertNotNull($sentBatch);
+        $this->assertCount(1, $sentBatch);
+        $this->assertEquals(1, $sentBatch[0]['exit_code']);
     }
 }

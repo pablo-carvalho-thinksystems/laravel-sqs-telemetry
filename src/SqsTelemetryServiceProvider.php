@@ -300,7 +300,7 @@ class SqsTelemetryServiceProvider extends ServiceProvider
             }
 
             // Redact sensitive keys
-            if (preg_match('/password|secret|token|api_key|cpf|cnpj|authorization/i', $key)) {
+            if (preg_match('/password|secret|token|api_key|cpf|cnpj|authorization/i', (string) $key)) {
                 $sanitized[$key] = '[REDACTED]';
                 continue;
             }

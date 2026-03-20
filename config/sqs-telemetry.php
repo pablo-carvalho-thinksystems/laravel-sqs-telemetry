@@ -91,6 +91,7 @@ return [
     'timeline' => [
         'db'          => env('SQS_TELEMETRY_TIMELINE_DB', true),
         'db_bindings' => true,
+        'db_source_location' => env('SQS_TELEMETRY_TIMELINE_DB_SOURCE', true),
         'http'        => env('SQS_TELEMETRY_TIMELINE_HTTP', true),
         'cache'       => env('SQS_TELEMETRY_TIMELINE_CACHE', true),
         'commands'    => env('SQS_TELEMETRY_TIMELINE_COMMANDS', true),

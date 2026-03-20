@@ -108,4 +108,74 @@ class TimelineContextTest extends TestCase
         $this->assertEquals('[REDACTED]', $dbEvent['context']['bindings'][2]); // password
         $this->assertEquals('[REDACTED]', $dbEvent['context']['bindings'][3]); // cpf
     }
+
+    public function test_db_query_source_location_does_not_error_when_enabled()
+    {
+        config()->set('sqs-telemetry.timeline.db', true);
+        config()->set('sqs-telemetry.timeline.db_source_location', true);
+
+        $timelineContext = $this->app->make(TimelineContext::class);
+        $timelineContext->startRequest();
+
+        $connection = $this->app['db']->connection();
+        event(new QueryExecuted(
+            'select * from users where id = ?',
+            [1],
+            5.0,
+            $connection
+        ));
+
+        $timeline = $timelineContext->getTimeline();
+        $dbEvent = collect($timeline)->firstWhere('type', 'db_query');
+
+        // The query event should be captured successfully regardless of
+        // whether source location is resolved (in test env it won't find
+        // an app-level frame, so source keys may be absent — that's OK).
+        $this->assertNotNull($dbEvent);
+        $this->assertEquals('select * from users where id = ?', $dbEvent['description']);
+    }
+
+    public function test_db_query_source_location_keys_format_when_present()
+    {
+        // Directly test the addEvent + metadata format to ensure
+        // that when source IS resolved, the keys have the right types.
+        $timelineContext = $this->app->make(TimelineContext::class);
+
+        $timelineContext->addEvent('db_query', 'select 1', 1.0, [
+            'connection'  => 'mysql',
+            'database'    => 'test',
+            'source_file' => 'app/Http/Controllers/UserController.php',
+            'source_line' => 42,
+        ]);
+
+        $timeline = $timelineContext->getTimeline();
+        $dbEvent = $timeline[0];
+
+        $this->assertEquals('app/Http/Controllers/UserController.php', $dbEvent['context']['source_file']);
+        $this->assertEquals(42, $dbEvent['context']['source_line']);
+    }
+
+    public function test_db_query_does_not_capture_source_location_when_disabled()
+    {
+        config()->set('sqs-telemetry.timeline.db', true);
+        config()->set('sqs-telemetry.timeline.db_source_location', false);
+
+        $timelineContext = $this->app->make(TimelineContext::class);
+        $timelineContext->startRequest();
+
+        $connection = $this->app['db']->connection();
+        event(new QueryExecuted(
+            'select * from users where id = ?',
+            [1],
+            5.0,
+            $connection
+        ));
+
+        $timeline = $timelineContext->getTimeline();
+        $dbEvent = collect($timeline)->firstWhere('type', 'db_query');
+
+        $this->assertNotNull($dbEvent);
+        $this->assertArrayNotHasKey('source_file', $dbEvent['context']);
+        $this->assertArrayNotHasKey('source_line', $dbEvent['context']);
+    }
 }

@@ -108,6 +108,14 @@ class SqsTelemetryServiceProvider extends ServiceProvider
                     $metadata['bindings'] = $this->sanitizeBindings($event->sql, $event->bindings);
                 }
 
+                if (config('sqs-telemetry.timeline.db_source_location', true)) {
+                    $source = $this->resolveQuerySource();
+                    if ($source) {
+                        $metadata['source_file'] = $source['file'];
+                        $metadata['source_line'] = $source['line'];
+                    }
+                }
+
                 $timelineContext->addEvent('db_query', $event->sql, $event->time, $metadata);
             });
         }
@@ -316,6 +324,52 @@ class SqsTelemetryServiceProvider extends ServiceProvider
         }
 
         return $sanitized;
+    }
+
+    /**
+     * Resolve the application-level source file and line that triggered a database query.
+     * Uses debug_backtrace to find the first frame within the application code.
+     *
+     * @return array|null Returns ['file' => relative_path, 'line' => int] or null.
+     */
+    protected function resolveQuerySource(): ?array
+    {
+        $basePath = base_path();
+        $vendorPath = base_path('vendor');
+        $packagePath = realpath(__DIR__) ?: __DIR__;
+
+        $frames = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 50);
+
+        foreach ($frames as $frame) {
+            if (!isset($frame['file']) || !isset($frame['line'])) {
+                continue;
+            }
+
+            $file = $frame['file'];
+
+            // Skip vendor files
+            if (strpos($file, $vendorPath) === 0) {
+                continue;
+            }
+
+            // Skip this package's own files
+            if (strpos($file, $packagePath) === 0) {
+                continue;
+            }
+
+            // Must be within the application base path
+            if (strpos($file, $basePath) === 0) {
+                // Return relative path to avoid exposing server paths
+                $relativePath = str_replace($basePath . '/', '', $file);
+
+                return [
+                    'file' => $relativePath,
+                    'line' => $frame['line'],
+                ];
+            }
+        }
+
+        return null;
     }
 
     /**

@@ -109,10 +109,14 @@ class SqsTelemetryServiceProvider extends ServiceProvider
                 }
 
                 if (config('sqs-telemetry.timeline.db_source_location', true)) {
-                    $source = $this->resolveQuerySource();
-                    if ($source) {
-                        $metadata['source_file'] = $source['file'];
-                        $metadata['source_line'] = $source['line'];
+                    try {
+                        $source = $this->resolveQuerySource();
+                        if ($source) {
+                            $metadata['source_file'] = $source['file'];
+                            $metadata['source_line'] = $source['line'];
+                        }
+                    } catch (\Throwable $e) {
+                        // Silently fail to avoid breaking query capture
                     }
                 }
 
@@ -335,8 +339,13 @@ class SqsTelemetryServiceProvider extends ServiceProvider
     protected function resolveQuerySource(): ?array
     {
         $basePath = base_path();
-        $vendorPath = base_path('vendor');
-        $packagePath = realpath(__DIR__) ?: __DIR__;
+        $vendorPath = base_path('vendor') . DIRECTORY_SEPARATOR;
+
+        // Patterns to skip: vendor dir, Laravel framework internals, and this package
+        $skipPatterns = [
+            $vendorPath,
+            DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR,
+        ];
 
         $frames = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 50);
 
@@ -347,26 +356,36 @@ class SqsTelemetryServiceProvider extends ServiceProvider
 
             $file = $frame['file'];
 
-            // Skip vendor files
-            if (strpos($file, $vendorPath) === 0) {
+            // Skip files matching any skip pattern
+            $skip = false;
+            foreach ($skipPatterns as $pattern) {
+                if (strpos($file, $pattern) !== false) {
+                    $skip = true;
+                    break;
+                }
+            }
+
+            if ($skip) {
                 continue;
             }
 
-            // Skip this package's own files
-            if (strpos($file, $packagePath) === 0) {
+            // Skip PHP internal files (eval'd code, etc.)
+            if (strpos($file, 'eval()') !== false || strpos($file, 'php://') !== false) {
                 continue;
             }
 
-            // Must be within the application base path
+            // Try to make the path relative to base_path
             if (strpos($file, $basePath) === 0) {
-                // Return relative path to avoid exposing server paths
-                $relativePath = str_replace($basePath . '/', '', $file);
-
-                return [
-                    'file' => $relativePath,
-                    'line' => $frame['line'],
-                ];
+                $relativePath = ltrim(str_replace($basePath, '', $file), DIRECTORY_SEPARATOR);
+            } else {
+                // If not inside base_path, use the basename with parent dir for context
+                $relativePath = basename(dirname($file)) . DIRECTORY_SEPARATOR . basename($file);
             }
+
+            return [
+                'file' => $relativePath,
+                'line' => $frame['line'],
+            ];
         }
 
         return null;

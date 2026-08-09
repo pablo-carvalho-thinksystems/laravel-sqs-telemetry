@@ -6,6 +6,8 @@ namespace Pablocarvalho\SqsTelemetry\Middleware;
 
 use Closure;
 use Illuminate\Http\Request;
+use Pablocarvalho\SqsTelemetry\Services\RequestSanitizer;
+use Pablocarvalho\SqsTelemetry\Services\Sampler;
 use Pablocarvalho\SqsTelemetry\Services\SqsBuffer;
 use Pablocarvalho\SqsTelemetry\Services\TimelineContext;
 use Symfony\Component\HttpFoundation\Response;
@@ -22,10 +24,26 @@ class SqsTelemetryBufferMiddleware
      */
     protected $timelineContext;
 
-    public function __construct(SqsBuffer $buffer, TimelineContext $timelineContext)
-    {
+    /**
+     * @var Sampler
+     */
+    protected $sampler;
+
+    /**
+     * @var RequestSanitizer
+     */
+    protected $sanitizer;
+
+    public function __construct(
+        SqsBuffer $buffer,
+        TimelineContext $timelineContext,
+        Sampler $sampler,
+        RequestSanitizer $sanitizer
+    ) {
         $this->buffer = $buffer;
         $this->timelineContext = $timelineContext;
+        $this->sampler = $sampler;
+        $this->sanitizer = $sanitizer;
     }
 
     /**
@@ -37,6 +55,10 @@ class SqsTelemetryBufferMiddleware
      */
     public function handle(Request $request, Closure $next)
     {
+        if (! $this->sampler->shouldRecord()) {
+            return $next($request);
+        }
+
         // Start the timeline recording
         $this->timelineContext->startRequest();
 
@@ -45,69 +67,71 @@ class SqsTelemetryBufferMiddleware
         /** @var Response $response */
         $response = $next($request);
 
-        if (config('sqs-telemetry.enabled', true)) {
-            $executionTime = round((microtime(true) - $startTime) * 1000, 2); // ms
+        $base = [
+            'project'    => config('sqs-telemetry.project', 'laravel-app'),
+            'url'        => $request->fullUrl(),
+            'method'     => $request->method(),
+            'ip'         => $request->ip(),
+            'user_agent' => $request->userAgent(),
+            'timestamp'  => now()->toIso8601String(),
+            'payload'    => $this->sanitizer->payload($request->all()),
+            'headers'    => $this->sanitizer->headers($request->headers->all()),
+            'capture_source' => 'middleware',
+        ];
 
-            // Add an explicit response event to the timeline before sending
-            $this->timelineContext->addEvent('response_sent', 'HTTP Response Sent', 0.0, [
-                'status_code' => $response->getStatusCode(),
-            ]);
+        if (config('sqs-telemetry.capture.defer_request_to_flush', false)) {
+            $this->deferRequest($base, $startTime);
 
-            $this->buffer->addRequest([
-                'project'        => config('sqs-telemetry.project', 'laravel-app'),
-                'url'            => $request->fullUrl(),
-                'method'         => $request->method(),
-                'ip'             => $request->ip(),
-                'user_agent'     => $request->userAgent(),
-                'status_code'    => $response->getStatusCode(),
-                'execution_time' => $executionTime,
-                'timestamp'      => now()->toIso8601String(),
-                'payload'        => $this->filterPayload($request->all()),
-                'headers'        => $this->filterHeaders($request->headers->all()),
-                'timeline'       => $this->timelineContext->getTimeline(),
-            ]);
+            return $response;
         }
+
+        $executionTime = round((microtime(true) - $startTime) * 1000, 2); // ms
+
+        // Add an explicit response event to the timeline before sending
+        $this->timelineContext->addEvent('response_sent', 'HTTP Response Sent', 0.0, [
+            'status_code' => $response->getStatusCode(),
+        ]);
+
+        $this->buffer->addRequest($base + [
+            'status_code'    => $response->getStatusCode(),
+            'execution_time' => $executionTime,
+            'timeline'       => $this->timelineContext->getTimeline(),
+        ]);
 
         return $response;
     }
 
     /**
-     * Filters out sensitive headers (like authorization tokens).
+     * Assemble the request entry when the buffer drains instead of now.
      *
-     * @param array $headers
-     * @return array
+     * On hosts that finish producing the response after Laravel's middleware
+     * stack has unwound — Acorn serving a WordPress page, where the kernel runs
+     * on `after_setup_theme` and WordPress renders afterwards — measuring here
+     * would time the kernel pass and miss the page. Everything this middleware
+     * knows is captured now; duration, status and timeline are read at flush.
+     *
+     * @param array $base
+     * @param float $startTime
+     * @return void
      */
-    protected function filterHeaders(array $headers): array
+    protected function deferRequest(array $base, float $startTime): void
     {
-        $sensitive = ['authorization', 'cookie', 'php-auth-pw'];
+        $timelineContext = $this->timelineContext;
 
-        foreach ($sensitive as $key) {
-            unset($headers[$key]);
-            unset($headers[strtolower($key)]);
-        }
+        $this->buffer->deferRequest(function () use ($base, $startTime, $timelineContext) {
+            $statusCode = function_exists('http_response_code') ? http_response_code() : null;
+            $statusCode = is_int($statusCode) ? $statusCode : null;
 
-        // Return flattened headers if multiple values exist for the same key
-        return array_map(function ($value) {
-            return is_array($value) ? implode(', ', $value) : $value;
-        }, $headers);
+            $timelineContext->addEvent('response_sent', 'HTTP Response Sent', 0.0, [
+                'status_code' => $statusCode,
+            ]);
+
+            return $base + [
+                'status_code'    => $statusCode,
+                'execution_time' => round((microtime(true) - $startTime) * 1000, 2),
+                'timeline'       => $timelineContext->getTimeline(),
+            ];
+        });
     }
 
-    /**
-     * Filters out sensitive payload data (like passwords).
-     *
-     * @param array $payload
-     * @return array
-     */
-    protected function filterPayload(array $payload): array
-    {
-        $sensitive = ['password', 'password_confirmation', 'token', 'secret', 'authorization'];
-
-        foreach ($sensitive as $key) {
-            if (isset($payload[$key])) {
-                $payload[$key] = '********';
-            }
-        }
-
-        return $payload;
-    }
 }

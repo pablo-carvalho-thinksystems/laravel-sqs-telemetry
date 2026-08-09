@@ -63,6 +63,107 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Flush On Shutdown
+    |--------------------------------------------------------------------------
+    |
+    | `terminating()` is fired by Laravel's own HTTP/Console kernels. Hosts that
+    | embed the container without owning the request lifecycle — Acorn inside
+    | WordPress being the canonical case — never fire it, and the buffer would be
+    | discarded. Keeping this on registers a PHP shutdown function as a fallback.
+    |
+    */
+    'flush_on_shutdown' => env('SQS_TELEMETRY_FLUSH_ON_SHUTDOWN', true),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Sampling
+    |--------------------------------------------------------------------------
+    |
+    | Fraction of requests (0.0 to 1.0) that record telemetry. The decision is
+    | taken once per request, before any listener does work, so an unsampled
+    | request pays almost nothing — no timeline, no buffer, no SQS call.
+    |
+    | Exceptions ignore this setting when `always_record_exceptions` is on: an
+    | error is never worth dropping, however aggressive the sampling.
+    |
+    */
+    'sampling' => [
+        'rate'                     => env('SQS_TELEMETRY_SAMPLING_RATE', 1.0),
+        'always_record_exceptions' => env('SQS_TELEMETRY_ALWAYS_RECORD_EXCEPTIONS', true),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Payload Limits
+    |--------------------------------------------------------------------------
+    |
+    | SQS caps a SendMessageBatch call at 256 KB across every entry, so an
+    | oversized timeline does not merely bloat the payload — it fails the whole
+    | batch. These limits keep a single pathological request from costing every
+    | other message batched alongside it.
+    |
+    | `max_timeline_events` matters most on query-heavy stacks (a WordPress page
+    | load can issue hundreds of queries in one request).
+    |
+    */
+    'limits' => [
+        'max_timeline_events'   => env('SQS_TELEMETRY_MAX_TIMELINE_EVENTS', 200),
+        'max_logs_per_request'  => env('SQS_TELEMETRY_MAX_LOGS_PER_REQUEST', 50),
+        'max_message_bytes'     => env('SQS_TELEMETRY_MAX_MESSAGE_BYTES', 240000),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Capture Behaviour
+    |--------------------------------------------------------------------------
+    |
+    | Turn this on where the response is produced *after* Laravel's middleware
+    | stack has unwound. Acorn serving a WordPress page is the case it exists
+    | for: the kernel runs on `after_setup_theme` and WordPress renders after
+    | it, so a middleware measuring on the way out times the kernel pass and
+    | reports an empty timeline with the wrong status code.
+    |
+    | With it on, duration, status and timeline are read when the buffer drains
+    | during `terminating()` — after the real response exists.
+    |
+    | `fallback_to_shutdown` covers the other half of the same problem: hosts
+    | that bootstrap the framework and then never route through it. Acorn hands
+    | `/wp-admin`, `/wp-json`, `wp-login.php` and every `.php` path back to
+    | WordPress *after* bootstrapping the kernel, so listeners collect but no
+    | middleware ever runs and the request goes unrecorded. With this on, the
+    | request is reconstructed from PHP's superglobals at shutdown and marked
+    | `capture_source: shutdown`.
+    |
+    | `finish_request_before_flush` releases the response to the client before
+    | the SQS call, and applies only to that fallback path — when the kernel
+    | handles the request the host has already released it. Output written
+    | after this point is discarded, which is why it is opt-in.
+    |
+    */
+    'capture' => [
+        'defer_request_to_flush' => env('SQS_TELEMETRY_DEFER_REQUEST', false),
+        'fallback_to_shutdown' => env('SQS_TELEMETRY_FALLBACK_TO_SHUTDOWN', false),
+        'finish_request_before_flush' => env('SQS_TELEMETRY_FINISH_REQUEST', false),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Context Resolver
+    |--------------------------------------------------------------------------
+    |
+    | Class name of a resolver that adds host-specific fields to every message
+    | (tenant, site, release, pod...). It must implement the package's
+    | `Contracts\ContextResolver` interface and is resolved from the container.
+    |
+    | A class name rather than a closure so the config stays cacheable.
+    |
+    */
+    'context' => [
+        'resolver' => null,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | AI Exception Analyzer
     |--------------------------------------------------------------------------
     |
@@ -87,11 +188,15 @@ return [
     | Configuration for capturing the request timeline (execution times).
     | You can enable or disable specific types of timeline events.
     |
+    | `db_source_location` walks a 50-frame backtrace for every query executed.
+    | That is affordable while debugging a handful of queries and ruinous on a
+    | stack that issues hundreds per request, so it stays off unless asked for.
+    |
     */
     'timeline' => [
         'db'          => env('SQS_TELEMETRY_TIMELINE_DB', true),
         'db_bindings' => true,
-        'db_source_location' => env('SQS_TELEMETRY_TIMELINE_DB_SOURCE', true),
+        'db_source_location' => env('SQS_TELEMETRY_TIMELINE_DB_SOURCE', false),
         'http'        => env('SQS_TELEMETRY_TIMELINE_HTTP', true),
         'cache'       => env('SQS_TELEMETRY_TIMELINE_CACHE', true),
         'commands'    => env('SQS_TELEMETRY_TIMELINE_COMMANDS', true),

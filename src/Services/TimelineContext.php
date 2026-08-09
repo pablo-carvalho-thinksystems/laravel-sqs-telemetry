@@ -12,6 +12,13 @@ class TimelineContext
     protected $timeline = [];
 
     /**
+     * Events discarded after the cap was reached.
+     *
+     * @var int
+     */
+    protected $droppedEvents = 0;
+
+    /**
      * Set the start of the request, clearing any previous state.
      */
     public function startRequest(): void
@@ -42,6 +49,14 @@ class TimelineContext
      */
     public function addEvent(string $type, string $description, float $durationMs, array $context = [], ?string $timestamp = null): void
     {
+        $max = (int) config('sqs-telemetry.limits.max_timeline_events', 200);
+
+        if ($max > 0 && count($this->timeline) >= $max) {
+            $this->droppedEvents++;
+
+            return;
+        }
+
         $this->timeline[] = [
             'type' => $type,
             'description' => $description,
@@ -58,7 +73,33 @@ class TimelineContext
      */
     public function getTimeline(): array
     {
-        return $this->timeline;
+        if ($this->droppedEvents === 0) {
+            return $this->timeline;
+        }
+
+        // A truncated timeline that does not say so reads as a complete one,
+        // and "this request ran 200 queries" is a very different conclusion
+        // from "this request ran 200 queries that we bothered to record".
+        $timeline = $this->timeline;
+        $timeline[] = [
+            'type'        => 'timeline_truncated',
+            'description' => "Timeline truncated: {$this->droppedEvents} event(s) dropped",
+            'duration_ms' => 0.0,
+            'context'     => ['dropped' => $this->droppedEvents],
+            'timestamp'   => now()->toIso8601String(),
+        ];
+
+        return $timeline;
+    }
+
+    /**
+     * Number of events discarded after the cap was reached.
+     *
+     * @return int
+     */
+    public function droppedEvents(): int
+    {
+        return $this->droppedEvents;
     }
 
     /**
@@ -68,5 +109,6 @@ class TimelineContext
     public function flush(): void
     {
         $this->timeline = [];
+        $this->droppedEvents = 0;
     }
 }

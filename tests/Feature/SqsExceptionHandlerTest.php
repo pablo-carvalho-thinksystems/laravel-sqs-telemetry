@@ -7,6 +7,9 @@ use Mockery;
 use Pablocarvalho\SqsTelemetry\Handlers\SqsExceptionHandler;
 use Pablocarvalho\SqsTelemetry\Services\AiExceptionAnalyzer;
 use Pablocarvalho\SqsTelemetry\Services\CodeContextFetcher;
+use Pablocarvalho\SqsTelemetry\Services\ReportedExceptions;
+use Pablocarvalho\SqsTelemetry\Services\RequestSanitizer;
+use Pablocarvalho\SqsTelemetry\Services\Sampler;
 use Pablocarvalho\SqsTelemetry\Services\SqsBuffer;
 use Pablocarvalho\SqsTelemetry\Tests\TestCase;
 
@@ -35,7 +38,7 @@ class SqsExceptionHandlerTest extends TestCase
                 && $data['ai_resolution_report'] === null;
         }));
 
-        $handler = new SqsExceptionHandler($bufferMock, $fetcherMock, $aiMock);
+        $handler = new SqsExceptionHandler($bufferMock, $fetcherMock, $aiMock, new Sampler(), new ReportedExceptions(), new RequestSanitizer());
         $handler->report(new Exception('Test Exception'));
     }
 
@@ -49,7 +52,7 @@ class SqsExceptionHandlerTest extends TestCase
 
         $bufferMock->shouldReceive('addException')->never();
         
-        $handler = new SqsExceptionHandler($bufferMock, $fetcherMock, $aiMock);
+        $handler = new SqsExceptionHandler($bufferMock, $fetcherMock, $aiMock, new Sampler(), new ReportedExceptions(), new RequestSanitizer());
         $handler->report(new Exception('Test Exception'));
     }
 
@@ -78,7 +81,57 @@ class SqsExceptionHandlerTest extends TestCase
                 && $data['ai_resolution_report'] === 'Mocked AI Report Markdown';
         }));
 
-        $handler = new SqsExceptionHandler($bufferMock, $fetcherMock, $aiMock);
+        $handler = new SqsExceptionHandler($bufferMock, $fetcherMock, $aiMock, new Sampler(), new ReportedExceptions(), new RequestSanitizer());
         $handler->report($e);
+    }
+
+    public function test_handler_reports_the_same_exception_only_once()
+    {
+        config([
+            'sqs-telemetry.enabled' => true,
+            'sqs-telemetry.project' => 'test-project',
+        ]);
+
+        $bufferMock = Mockery::mock(SqsBuffer::class);
+        $fetcherMock = Mockery::mock(CodeContextFetcher::class);
+        $aiMock = Mockery::mock(AiExceptionAnalyzer::class);
+
+        $fetcherMock->shouldReceive('fetchContext')->andReturn(null);
+        $aiMock->shouldReceive('isEnabled')->andReturn(false);
+
+        // The host's reporting hook and the MessageLogged listener both see an
+        // uncaught exception; the shared registry keeps that to one message.
+        $bufferMock->shouldReceive('addException')->once();
+
+        $handler = new SqsExceptionHandler($bufferMock, $fetcherMock, $aiMock, new Sampler(), new ReportedExceptions(), new RequestSanitizer());
+
+        $e = new Exception('Reported twice');
+        $handler->report($e);
+        $handler->report($e);
+    }
+
+    public function test_handler_reports_distinct_exceptions_separately()
+    {
+        config([
+            'sqs-telemetry.enabled' => true,
+            'sqs-telemetry.project' => 'test-project',
+        ]);
+
+        $bufferMock = Mockery::mock(SqsBuffer::class);
+        $fetcherMock = Mockery::mock(CodeContextFetcher::class);
+        $aiMock = Mockery::mock(AiExceptionAnalyzer::class);
+
+        $fetcherMock->shouldReceive('fetchContext')->andReturn(null);
+        $aiMock->shouldReceive('isEnabled')->andReturn(false);
+
+        $bufferMock->shouldReceive('addException')->twice();
+
+        $handler = new SqsExceptionHandler($bufferMock, $fetcherMock, $aiMock, new Sampler(), new ReportedExceptions(), new RequestSanitizer());
+
+        $first = new Exception('First');
+        $second = new Exception('Second');
+
+        $handler->report($first);
+        $handler->report($second);
     }
 }

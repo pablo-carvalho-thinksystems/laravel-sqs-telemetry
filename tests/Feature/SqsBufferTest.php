@@ -54,4 +54,66 @@ class SqsBufferTest extends TestCase
 
         $this->assertEmpty($messages);
     }
+
+    public function test_the_request_latch_survives_a_flush()
+    {
+        $sqsClientMock = Mockery::mock(SqsClientService::class);
+        $sqsClientMock->shouldReceive('sendBatch');
+
+        $buffer = new SqsBuffer($sqsClientMock);
+
+        $this->assertFalse($buffer->hasRecordedRequest());
+
+        $buffer->addRequest(['url' => 'http://localhost/test']);
+        $buffer->flush();
+
+        // The shutdown fallback runs after the buffer has already drained, so
+        // an empty buffer must not read as "this request went unrecorded".
+        $this->assertTrue($buffer->hasRecordedRequest());
+    }
+
+    public function test_a_deferred_request_counts_as_recorded()
+    {
+        $sqsClientMock = Mockery::mock(SqsClientService::class);
+        $buffer = new SqsBuffer($sqsClientMock);
+
+        $buffer->deferRequest(function () {
+            return ['url' => 'http://localhost/test'];
+        });
+
+        $this->assertTrue($buffer->hasRecordedRequest());
+    }
+
+    public function test_resetting_request_state_clears_the_latch()
+    {
+        $sqsClientMock = Mockery::mock(SqsClientService::class);
+        $buffer = new SqsBuffer($sqsClientMock);
+
+        $buffer->addRequest(['url' => 'http://localhost/test']);
+        $buffer->resetRequestState();
+
+        $this->assertFalse($buffer->hasRecordedRequest());
+    }
+
+    public function test_a_deferred_request_is_materialised_only_once()
+    {
+        $calls = 0;
+
+        $sqsClientMock = Mockery::mock(SqsClientService::class);
+        $sqsClientMock->shouldReceive('sendBatch')->once();
+
+        $buffer = new SqsBuffer($sqsClientMock);
+
+        $buffer->deferRequest(function () use (&$calls) {
+            $calls++;
+
+            return ['url' => 'http://localhost/test'];
+        });
+
+        // Both `terminating()` and the shutdown function drain the buffer.
+        $buffer->flush();
+        $buffer->flush();
+
+        $this->assertSame(1, $calls);
+    }
 }

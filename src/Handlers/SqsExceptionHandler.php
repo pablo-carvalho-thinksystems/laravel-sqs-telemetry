@@ -7,6 +7,9 @@ namespace Pablocarvalho\SqsTelemetry\Handlers;
 use Illuminate\Support\Facades\Log;
 use Pablocarvalho\SqsTelemetry\Services\AiExceptionAnalyzer;
 use Pablocarvalho\SqsTelemetry\Services\CodeContextFetcher;
+use Pablocarvalho\SqsTelemetry\Services\ReportedExceptions;
+use Pablocarvalho\SqsTelemetry\Services\RequestSanitizer;
+use Pablocarvalho\SqsTelemetry\Services\Sampler;
 use Pablocarvalho\SqsTelemetry\Services\SqsBuffer;
 use Throwable;
 
@@ -27,14 +30,35 @@ class SqsExceptionHandler
      */
     protected $aiAnalyzer;
 
+    /**
+     * @var Sampler
+     */
+    protected $sampler;
+
+    /**
+     * @var ReportedExceptions
+     */
+    protected $reported;
+
+    /**
+     * @var RequestSanitizer
+     */
+    protected $sanitizer;
+
     public function __construct(
         SqsBuffer $buffer,
         CodeContextFetcher $contextFetcher,
-        AiExceptionAnalyzer $aiAnalyzer
+        AiExceptionAnalyzer $aiAnalyzer,
+        Sampler $sampler,
+        ReportedExceptions $reported,
+        RequestSanitizer $sanitizer
     ) {
         $this->buffer = $buffer;
         $this->contextFetcher = $contextFetcher;
         $this->aiAnalyzer = $aiAnalyzer;
+        $this->sampler = $sampler;
+        $this->reported = $reported;
+        $this->sanitizer = $sanitizer;
     }
 
     /**
@@ -45,9 +69,15 @@ class SqsExceptionHandler
      */
     public function report(Throwable $e): void
     {
-        if (!config('sqs-telemetry.enabled', true)) {
+        if (! $this->sampler->shouldRecordExceptions()) {
             return;
         }
+
+        if (! $this->reported->claim($e)) {
+            return;
+        }
+
+        $this->sampler->forceRecord();
 
         try {
             $request = request();
@@ -61,7 +91,7 @@ class SqsExceptionHandler
             $this->buffer->addException([
                 'project'     => config('sqs-telemetry.project', 'laravel-app'),
                 'class'       => get_class($e),
-                'message'     => utf8_encode((string)$e->getMessage()),
+                'message'     => $this->toUtf8((string) $e->getMessage()),
                 'file'        => $e->getFile(),
                 'line'        => $e->getLine(),
                 'url'         => $request ? $request->fullUrl() : 'Console/Cli',
@@ -71,7 +101,7 @@ class SqsExceptionHandler
                 'headers'     => $this->safeGetHeaders($request),
                 'ai_resolution_report' => $aiReport,
                 // Only capture the first 10 lines of the stack trace to not bloat the SQS message size
-                'stack_trace' => utf8_encode(implode("\n", array_slice(explode("\n", $e->getTraceAsString()), 0, 10))),
+                'stack_trace' => $this->toUtf8(implode("\n", array_slice(explode("\n", $e->getTraceAsString()), 0, 10))),
             ]);
         } catch (Throwable $internalException) {
             Log::error('SqsTelemetry: Falha ao reportar exceção pro buffer.', [
@@ -80,6 +110,26 @@ class SqsExceptionHandler
                 'file'  => $internalException->getFile(),
             ]);
         }
+    }
+
+    /**
+     * Coerce a string into valid UTF-8 so `json_encode` cannot reject it.
+     *
+     * Replaces the old `utf8_encode()` call, which is deprecated as of PHP 8.2
+     * and mangles text that was already UTF-8 — the common case here, since an
+     * exception message in this application is far more likely to be UTF-8 than
+     * Latin-1. Text that is already valid is now left untouched.
+     *
+     * @param string $value
+     * @return string
+     */
+    protected function toUtf8(string $value): string
+    {
+        if (! function_exists('mb_check_encoding') || mb_check_encoding($value, 'UTF-8')) {
+            return $value;
+        }
+
+        return mb_convert_encoding($value, 'UTF-8', 'ISO-8859-1');
     }
 
     /**
@@ -96,7 +146,8 @@ class SqsExceptionHandler
 
         try {
             $payload = $request->all();
-            return is_array($payload) ? $this->filterPayload($payload) : null;
+
+            return is_array($payload) ? $this->sanitizer->payload($payload) : null;
         } catch (Throwable $e) {
             return ['error' => 'Could not parse payload'];
         }
@@ -116,48 +167,10 @@ class SqsExceptionHandler
 
         try {
             $headers = $request->headers ? $request->headers->all() : [];
-            return is_array($headers) ? $this->filterHeaders($headers) : null;
+
+            return is_array($headers) ? $this->sanitizer->headers($headers) : null;
         } catch (Throwable $e) {
             return ['error' => 'Could not parse headers'];
         }
-    }
-
-    /**
-     * Filters out sensitive headers (like authorization tokens).
-     *
-     * @param array $headers
-     * @return array
-     */
-    protected function filterHeaders(array $headers): array
-    {
-        $sensitive = ['authorization', 'cookie', 'php-auth-pw'];
-
-        foreach ($sensitive as $key) {
-            unset($headers[$key]);
-            unset($headers[strtolower($key)]);
-        }
-
-        return array_map(function ($value) {
-            return is_array($value) ? implode(', ', $value) : $value;
-        }, $headers);
-    }
-
-    /**
-     * Filters out sensitive payload data.
-     *
-     * @param array $payload
-     * @return array
-     */
-    protected function filterPayload(array $payload): array
-    {
-        $sensitive = ['password', 'password_confirmation', 'token', 'secret', 'authorization'];
-
-        foreach ($sensitive as $key) {
-            if (isset($payload[$key])) {
-                $payload[$key] = '********';
-            }
-        }
-
-        return $payload;
     }
 }

@@ -2,7 +2,7 @@
 
 Um pacote Laravel projetado para capturar exceções (tratadas e não tratadas), interceptar requisições HTTP, monitorar queries de banco, comandos Artisan e operações de cache, enviando tudo de forma assíncrona (em lotes) para a AWS SQS sem bloquear o tempo de resposta da aplicação principal.
 
-**Compatível com PHP 7.2+ e Laravel 6 até 11.**
+**Compatível com PHP 7.2+ e Laravel 6 até 13.**
 
 ## Compatibilidade
 
@@ -14,6 +14,11 @@ Um pacote Laravel projetado para capturar exceções (tratadas e não tratadas),
 | 9.x     | 8.0+    | ✅      |
 | 10.x    | 8.1+    | ✅      |
 | 11.x    | 8.2+    | ✅      |
+| 12.x    | 8.2+    | ✅      |
+| 13.x    | 8.3+    | ✅      |
+
+Também roda em **Acorn (WordPress)**, que exige configuração específica — veja
+[Hosts que não roteiam pelo kernel](#hosts-que-não-roteiam-pelo-kernel-acorn--wordpress).
 
 > **Nota:** No Laravel 6, os listeners de HTTP Client (`ResponseReceived`, `ConnectionFailed`) não serão registrados, pois o HTTP Client foi introduzido no Laravel 7. Todas as demais funcionalidades (queries, cache, commands, exceptions) funcionam normalmente.
 
@@ -67,6 +72,57 @@ SQS_TELEMETRY_BATCH_SIZE=10
 # AI Configs (Opcional - Requer OpenAI Key)
 SQS_TELEMETRY_AI_ENABLED=true
 SQS_TELEMETRY_AI_API_KEY="sk-..."
+```
+
+## Custo por request
+
+Cada request registrada termina com uma chamada de rede ao SQS. Em hosts que
+mantêm a thread ocupada até o script acabar (FPM, FrankenPHP em modo clássico),
+esse custo é de **thread**, não só de latência percebida — a resposta já saiu,
+mas o worker continua preso. Três mecanismos existem para controlar isso.
+
+### Sampling
+
+A fração de requests que registram telemetria. O sorteio acontece **uma vez por
+request, antes de qualquer listener trabalhar**, então uma request não sorteada
+não paga quase nada: sem timeline, sem buffer, sem chamada ao SQS.
+
+```env
+SQS_TELEMETRY_SAMPLING_RATE=0.05          # 5% das requests
+SQS_TELEMETRY_ALWAYS_RECORD_EXCEPTIONS=true
+```
+
+Exceções ignoram o sorteio por padrão — um erro nunca vale a pena descartar, por
+mais agressivo que seja o sampling. Requests de console são sempre registradas
+(são poucas e cada uma interessa individualmente).
+
+### Limites de payload
+
+O SQS limita uma chamada `SendMessageBatch` a **256 KB somando todas as
+entradas**, então uma timeline gorda não só incha o payload: ela derruba o batch
+inteiro, levando junto as outras mensagens. Os limites impedem que uma request
+patológica custe as demais.
+
+```env
+SQS_TELEMETRY_MAX_TIMELINE_EVENTS=200     # importa em stacks com muitas queries
+SQS_TELEMETRY_MAX_LOGS_PER_REQUEST=50
+SQS_TELEMETRY_MAX_MESSAGE_BYTES=240000
+```
+
+Quando a timeline é cortada, um evento `timeline_truncated` entra no lugar com a
+contagem do que foi descartado — uma timeline truncada que não avisa se lê como
+uma timeline completa. Se ainda assim a mensagem não couber, os campos mais
+pesados (`timeline`, `payload`, `headers`, `stack_trace`) são descartados em
+ordem e a mensagem sai com `truncated_fields` preenchido.
+
+### Backtrace por query
+
+`db_source_location` percorre 50 frames de backtrace **a cada query executada**.
+É barato depurando um punhado de queries e ruinoso em stacks que disparam
+centenas por request, por isso vem **desligado**.
+
+```env
+SQS_TELEMETRY_TIMELINE_DB_SOURCE=true     # ligue só quando for investigar
 ```
 
 ## Uso
@@ -130,13 +186,95 @@ public function register(): void
 
 > **Exceptions tratadas (catch):** A partir da v1.0.7, exceptions logadas via `report($e)` ou `Log::error('msg', ['exception' => $e])` são capturadas automaticamente pelo listener `MessageLogged`, sem necessidade de configuração adicional.
 
+> **Sem duplicação:** uma exception não tratada chega ao buffer por dois caminhos
+> — o hook de report do host e o listener `MessageLogged`, quando o handler
+> padrão a escreve no log. Os dois compartilham um registro e a mensagem sai uma
+> vez só.
+
+## Hosts que não roteiam pelo kernel (Acorn / WordPress)
+
+Alguns hosts **bootam o framework mas não entregam a request ao HTTP kernel**.
+O caso canônico é o Acorn dentro do WordPress. Duas coisas quebram ali, e cada
+uma tem sua chave em `capture`.
+
+### 1. A resposta é produzida depois do middleware
+
+Na rota catch-all do WordPress o kernel roda em `after_setup_theme` e o
+WordPress renderiza **depois**. Um middleware medindo na saída cronometra a
+passagem do kernel, reporta timeline vazia e lê o status errado.
+
+```env
+SQS_TELEMETRY_DEFER_REQUEST=true
+```
+
+Com isso, duração, status e timeline são lidos quando o buffer drena no
+`terminating()` — depois de a resposta real existir.
+
+### 2. Paths que nunca chegam ao middleware
+
+O Acorn chama `$kernel->bootstrap()` em toda request e **só depois** devolve
+`/wp-admin`, `/wp-json`, `wp-login.php` e qualquer path `.php` para o WordPress.
+Nesses paths os listeners coletam normalmente, mas nenhum middleware roda — e a
+request sumiria da fila. Em site movimentado isso é boa parte do tráfego, e
+`admin-ajax.php` costuma ser onde a carga aparece primeiro.
+
+```env
+SQS_TELEMETRY_FALLBACK_TO_SHUTDOWN=true
+SQS_TELEMETRY_FINISH_REQUEST=true
+```
+
+Com o fallback ligado, a request é reconstruída das superglobais do PHP no
+shutdown e sai marcada com `capture_source: shutdown` (as capturadas pelo
+middleware saem como `middleware`). Elas não carregam informação de roteamento e
+a timeline delas começa no boot, não no middleware.
+
+`SQS_TELEMETRY_FINISH_REQUEST` chama `fastcgi_finish_request()` antes do envio,
+liberando a resposta ao cliente. Vale **só** para esse caminho de fallback — no
+caminho roteado o host já liberou a resposta e chamar de novo seria erro.
+Qualquer saída escrita depois desse ponto é descartada, por isso é opt-in.
+
+> **Depois de instalar em ambiente com cache quente**, rode
+> `php artisan package:discover`. Se o manifesto de auto-discovery estiver
+> desatualizado, o provider não é registrado e nada acontece — sem erro nenhum.
+
+## Contexto adicional nas mensagens
+
+Para carimbar toda mensagem com informação do host (tenant, release, pod), passe
+o nome de uma classe que implemente `Contracts\ContextResolver`. É um nome de
+classe, e não um closure, para o config continuar cacheável.
+
+```php
+// config/sqs-telemetry.php
+'context' => [
+    'resolver' => \App\Services\Telemetry\TenantContextResolver::class,
+],
+```
+
+```php
+use Pablocarvalho\SqsTelemetry\Contracts\ContextResolver;
+
+class TenantContextResolver implements ContextResolver
+{
+    public function resolve(): array
+    {
+        return ['tenant' => DB_NAME, 'site_host' => parse_url(WP_HOME, PHP_URL_HOST)];
+    }
+}
+```
+
+O resolver roda **uma vez por flush**, não por mensagem, durante o teardown da
+request — não deve lançar exceção nem fazer I/O. As chaves da própria mensagem
+vencem as do resolver, para que ele não consiga sobrescrever, por exemplo, a
+classe de uma exception.
+
 ## O que é capturado?
 
-### Request (Middleware)
+### Request (Middleware ou fallback de shutdown)
 - `url`, `method`, `ip`, `user_agent`
 - `status_code`, `execution_time` (em ms)
 - `timestamp`, `headers`, `payload` (senhas e tokens são substituídos por `********`)
 - `timeline` — eventos detalhados do ciclo de vida da request
+- `capture_source` — `middleware` ou `shutdown`
 
 ### Exceptions (Handler + MessageLogged)
 - `class`, `message`, `file`, `line`
@@ -196,12 +334,17 @@ Todas as opções de timeline podem ser configuradas no arquivo `config/sqs-tele
 
 ```php
 'timeline' => [
-    'db'          => env('SQS_TELEMETRY_TIMELINE_DB', true),
-    'db_bindings' => true, // sempre ativo, com sanitização automática
-    'http'        => env('SQS_TELEMETRY_TIMELINE_HTTP', true),
-    'cache'       => env('SQS_TELEMETRY_TIMELINE_CACHE', true),
-    'commands'    => env('SQS_TELEMETRY_TIMELINE_COMMANDS', true),
-    'exceptions'  => env('SQS_TELEMETRY_TIMELINE_EXCEPTIONS', true),
+    'db'                 => env('SQS_TELEMETRY_TIMELINE_DB', true),
+    'db_bindings'        => true, // sempre ativo, com sanitização automática
+    'db_source_location' => env('SQS_TELEMETRY_TIMELINE_DB_SOURCE', false), // caro: backtrace por query
+    'http'               => env('SQS_TELEMETRY_TIMELINE_HTTP', true),
+    'cache'              => env('SQS_TELEMETRY_TIMELINE_CACHE', true),
+    'commands'           => env('SQS_TELEMETRY_TIMELINE_COMMANDS', true),
+    'exceptions'         => env('SQS_TELEMETRY_TIMELINE_EXCEPTIONS', true),
+    'logs'               => env('SQS_TELEMETRY_TIMELINE_LOGS', true),
 ],
 ```
+
+Um evento `timeline_truncated` é acrescentado quando o limite de eventos é
+atingido, com a contagem do que ficou de fora.
 

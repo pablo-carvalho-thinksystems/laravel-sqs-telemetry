@@ -13,6 +13,10 @@ use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\ServiceProvider;
 use Pablocarvalho\SqsTelemetry\Handlers\SqsExceptionHandler;
 use Pablocarvalho\SqsTelemetry\Listeners\SqsCommandListener;
+use Pablocarvalho\SqsTelemetry\Services\ReportedExceptions;
+use Pablocarvalho\SqsTelemetry\Services\RequestSanitizer;
+use Pablocarvalho\SqsTelemetry\Services\Sampler;
+use Pablocarvalho\SqsTelemetry\Services\ServerRequestSnapshot;
 use Pablocarvalho\SqsTelemetry\Services\SqsBuffer;
 use Pablocarvalho\SqsTelemetry\Services\SqsClientService;
 use Pablocarvalho\SqsTelemetry\Services\TimelineContext;
@@ -46,6 +50,29 @@ class SqsTelemetryServiceProvider extends ServiceProvider
         $this->app->singleton(TimelineContext::class, function ($app) {
             return new TimelineContext();
         });
+
+        // One sampling decision per request, shared by every listener
+        $this->app->singleton(Sampler::class, function ($app) {
+            return new Sampler();
+        });
+
+        // Shared by the reporting hook and the MessageLogged listener, which
+        // both see the same uncaught exception
+        $this->app->singleton(ReportedExceptions::class, function ($app) {
+            return new ReportedExceptions();
+        });
+
+        // One set of redaction rules for every capture path
+        $this->app->singleton(RequestSanitizer::class, function ($app) {
+            return new RequestSanitizer();
+        });
+
+        $this->app->singleton(ServerRequestSnapshot::class, function ($app) {
+            return new ServerRequestSnapshot(
+                $app->make(RequestSanitizer::class),
+                $app->make(TimelineContext::class)
+            );
+        });
     }
 
     /**
@@ -72,7 +99,141 @@ class SqsTelemetryServiceProvider extends ServiceProvider
         // By hooking into the terminating event, we ensure that the buffer flush
         // only happens AFTER the HTTP response has already been sent to the user's browser.
         // This makes the I/O to AWS completely non-blocking for the application's response time.
-        $this->app->terminating(function () {
+        $this->app->terminating(function (): void {
+            $this->flushBuffers();
+        });
+
+        // Safety net for hosts that never terminate the Laravel application.
+        //
+        // `terminating()` is fired by Laravel's HTTP/Console kernels. In embedded
+        // setups the kernel may never own the request lifecycle — the canonical
+        // case being Acorn inside WordPress, where the container is booted from a
+        // mu-plugin and WordPress, not Laravel, ends the request. There the
+        // callback above never runs and the buffer is silently discarded.
+        //
+        // Registering a PHP shutdown function guarantees a flush in those hosts.
+        // `flushBuffers()` is idempotent (the buffer empties itself on flush), so
+        // when `terminating()` does fire this is a no-op.
+        if (config('sqs-telemetry.flush_on_shutdown', true)) {
+            register_shutdown_function(function (): void {
+                $this->finishRequest();
+            });
+        }
+    }
+
+    /**
+     * Last thing this process does: account for the request, then ship.
+     *
+     * @return void
+     */
+    protected function finishRequest()
+    {
+        if ($this->captureUnroutedRequest()) {
+            $this->releaseResponse();
+        }
+
+        $this->flushBuffers();
+
+        try {
+            if ($this->app->bound(SqsBuffer::class)) {
+                $this->app->make(SqsBuffer::class)->resetRequestState();
+            }
+        } catch (Throwable $e) {
+            // Nothing useful to do at this point in the request.
+        }
+    }
+
+    /**
+     * Record a request that the HTTP kernel never handled.
+     *
+     * Hosts that bootstrap the framework without routing through it leave the
+     * middleware unused, and the request would go unrecorded even though every
+     * listener was active and collecting. Acorn hands `/wp-admin`, `/wp-json`,
+     * `wp-login.php` and any `.php` path back to WordPress after bootstrapping
+     * the kernel, which on a busy site is a large share of the traffic — and
+     * `admin-ajax.php` in particular is where load tends to show up first.
+     *
+     * @return bool Whether an entry was recorded.
+     */
+    protected function captureUnroutedRequest()
+    {
+        try {
+            if (! config('sqs-telemetry.capture.fallback_to_shutdown', false)) {
+                return false;
+            }
+
+            if (! $this->app->bound(SqsBuffer::class)) {
+                return false;
+            }
+
+            $buffer = $this->app->make(SqsBuffer::class);
+
+            // The middleware already accounted for this request.
+            if ($buffer->hasRecordedRequest()) {
+                return false;
+            }
+
+            $snapshot = $this->app->make(ServerRequestSnapshot::class);
+
+            if (! $snapshot->isHttpRequest()) {
+                return false;
+            }
+
+            // Reuses the draw the listeners already made, so an unsampled
+            // request stays unsampled all the way through.
+            if (! $this->app->make(Sampler::class)->shouldRecord()) {
+                return false;
+            }
+
+            $buffer->addRequest(
+                $snapshot->capture((string) config('sqs-telemetry.project', 'laravel-app'))
+            );
+
+            return true;
+        } catch (Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Hand the response to the client before spending time on network I/O.
+     *
+     * Only used on the unrouted path. When the kernel does handle the request
+     * the host has already released the response by the time this runs, and
+     * calling it twice would be an error.
+     *
+     * Anything written to the output buffer after this point is discarded, so
+     * it stays opt-in.
+     *
+     * @return void
+     */
+    protected function releaseResponse()
+    {
+        if (! config('sqs-telemetry.capture.finish_request_before_flush', false)) {
+            return;
+        }
+
+        try {
+            if (function_exists('fastcgi_finish_request')) {
+                fastcgi_finish_request();
+            } elseif (function_exists('litespeed_finish_request')) {
+                litespeed_finish_request();
+            }
+        } catch (Throwable $e) {
+            // Shipping telemetry is not worth a fatal after the response.
+        }
+    }
+
+    /**
+     * Drain every buffer that has been resolved during this request.
+     *
+     * Safe to call more than once: each buffer clears itself before sending.
+     *
+     * @return void
+     */
+    protected function flushBuffers()
+    {
+        try {
             if ($this->app->bound(SqsBuffer::class)) {
                 $this->app->make(SqsBuffer::class)->flush();
             }
@@ -80,7 +241,19 @@ class SqsTelemetryServiceProvider extends ServiceProvider
             if ($this->app->bound(TimelineContext::class)) {
                 $this->app->make(TimelineContext::class)->flush();
             }
-        });
+
+            if ($this->app->bound(Sampler::class)) {
+                $this->app->make(Sampler::class)->reset();
+            }
+
+            if ($this->app->bound(ReportedExceptions::class)) {
+                $this->app->make(ReportedExceptions::class)->flush();
+            }
+        } catch (Throwable $e) {
+            // Telemetry must never take the host application down with it —
+            // least of all from a shutdown handler, where an exception would
+            // surface as a fatal error after the response was already sent.
+        }
     }
 
     /**
@@ -91,10 +264,15 @@ class SqsTelemetryServiceProvider extends ServiceProvider
     protected function registerTimelineListeners(): void
     {
         $timelineContext = $this->app->make(TimelineContext::class);
+        $sampler = $this->app->make(Sampler::class);
 
         // Database Queries
         if (config('sqs-telemetry.timeline.db', true)) {
-            $this->app['events']->listen(QueryExecuted::class, function (QueryExecuted $event) use ($timelineContext) {
+            $this->app['events']->listen(QueryExecuted::class, function (QueryExecuted $event) use ($timelineContext, $sampler) {
+                if (! $sampler->shouldRecord()) {
+                    return;
+                }
+
                 // Determine connection name and database if available
                 $connectionName = $event->connectionName ?? 'default';
                 $database = $event->connection->getDatabaseName();
@@ -127,7 +305,11 @@ class SqsTelemetryServiceProvider extends ServiceProvider
         // HTTP Client Requests
         if (config('sqs-telemetry.timeline.http', true)) {
             if (class_exists(ResponseReceived::class)) {
-                $this->app['events']->listen(ResponseReceived::class, function (ResponseReceived $event) use ($timelineContext) {
+                $this->app['events']->listen(ResponseReceived::class, function (ResponseReceived $event) use ($timelineContext, $sampler) {
+                    if (! $sampler->shouldRecord()) {
+                        return;
+                    }
+
                     $url = (string) $event->request->url();
                     $method = $event->request->method();
                     $status = $event->response->status();
@@ -144,7 +326,11 @@ class SqsTelemetryServiceProvider extends ServiceProvider
             }
 
             if (class_exists(ConnectionFailed::class)) {
-                $this->app['events']->listen(ConnectionFailed::class, function (ConnectionFailed $event) use ($timelineContext) {
+                $this->app['events']->listen(ConnectionFailed::class, function (ConnectionFailed $event) use ($timelineContext, $sampler) {
+                    if (! $sampler->shouldRecord()) {
+                        return;
+                    }
+
                     $url = (string) $event->request->url();
                     $method = $event->request->method();
                     
@@ -157,18 +343,24 @@ class SqsTelemetryServiceProvider extends ServiceProvider
 
         // Cache Operations (Basic Listeners)
         if (config('sqs-telemetry.timeline.cache', true)) {
-            $this->app['events']->listen(\Illuminate\Cache\Events\CacheHit::class, function ($event) use ($timelineContext) {
-                $timelineContext->addEvent('cache_hit', "Cache hit: {$event->key}", 0.0);
-            });
-            $this->app['events']->listen(\Illuminate\Cache\Events\CacheMissed::class, function ($event) use ($timelineContext) {
-                $timelineContext->addEvent('cache_miss', "Cache miss: {$event->key}", 0.0);
-            });
-            $this->app['events']->listen(\Illuminate\Cache\Events\KeyWritten::class, function ($event) use ($timelineContext) {
-                $timelineContext->addEvent('cache_write', "Cache write: {$event->key}", 0.0);
-            });
-            $this->app['events']->listen(\Illuminate\Cache\Events\KeyForgotten::class, function ($event) use ($timelineContext) {
-                $timelineContext->addEvent('cache_forget', "Cache forget: {$event->key}", 0.0);
-            });
+            $cacheEvents = [
+                \Illuminate\Cache\Events\CacheHit::class     => ['cache_hit', 'Cache hit'],
+                \Illuminate\Cache\Events\CacheMissed::class  => ['cache_miss', 'Cache miss'],
+                \Illuminate\Cache\Events\KeyWritten::class   => ['cache_write', 'Cache write'],
+                \Illuminate\Cache\Events\KeyForgotten::class => ['cache_forget', 'Cache forget'],
+            ];
+
+            foreach ($cacheEvents as $eventClass => $descriptor) {
+                list($type, $label) = $descriptor;
+
+                $this->app['events']->listen($eventClass, function ($event) use ($timelineContext, $sampler, $type, $label) {
+                    if (! $sampler->shouldRecord()) {
+                        return;
+                    }
+
+                    $timelineContext->addEvent($type, "{$label}: {$event->key}", 0.0);
+                });
+            }
         }
 
         // Logs & Exceptions (captured from MessageLogged event)
@@ -177,9 +369,9 @@ class SqsTelemetryServiceProvider extends ServiceProvider
 
         if ($captureExceptions || $captureLogs) {
             $buffer = $this->app->make(SqsBuffer::class);
-            $reportedExceptions = [];
+            $reportedExceptions = $this->app->make(ReportedExceptions::class);
 
-            $this->app['events']->listen(MessageLogged::class, function (MessageLogged $event) use ($timelineContext, $buffer, &$reportedExceptions, $captureExceptions, $captureLogs) {
+            $this->app['events']->listen(MessageLogged::class, function (MessageLogged $event) use ($timelineContext, $buffer, $sampler, $reportedExceptions, $captureExceptions, $captureLogs) {
                 // Skip internal SQS telemetry logs to avoid infinite loops
                 if (isset($event->context['__sqs_telemetry'])) {
                     return;
@@ -188,12 +380,13 @@ class SqsTelemetryServiceProvider extends ServiceProvider
                 $hasException = isset($event->context['exception']) && ($event->context['exception'] instanceof Throwable);
 
                 // Handle exception logs
-                if ($hasException && $captureExceptions) {
+                if ($hasException && $captureExceptions && $sampler->shouldRecordExceptions()) {
                     $exception = $event->context['exception'];
-                    $hash = spl_object_hash($exception);
 
-                    if (!isset($reportedExceptions[$hash])) {
-                        $reportedExceptions[$hash] = true;
+                    if ($reportedExceptions->claim($exception)) {
+                        // An unsampled request that turns out to have thrown is
+                        // worth recording in full from here on.
+                        $sampler->forceRecord();
 
                         $timelineContext->addEvent('exception', get_class($exception) . ': ' . $exception->getMessage(), 0.0, [
                             'class'   => get_class($exception),
@@ -228,7 +421,7 @@ class SqsTelemetryServiceProvider extends ServiceProvider
                 }
 
                 // Handle general logs (non-exception)
-                if ($captureLogs && !$hasException) {
+                if ($captureLogs && !$hasException && $sampler->shouldRecord()) {
                     // Add to timeline
                     $timelineContext->addEvent('log', "[{$event->level}] {$event->message}", 0.0, [
                         'level'   => $event->level,

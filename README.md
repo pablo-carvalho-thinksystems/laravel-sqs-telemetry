@@ -212,11 +212,19 @@ Com isso, duração, status e timeline são lidos quando o buffer drena no
 
 ### 2. Paths que nunca chegam ao middleware
 
-O Acorn chama `$kernel->bootstrap()` em toda request e **só depois** devolve
-`/wp-admin`, `/wp-json`, `wp-login.php` e qualquer path `.php` para o WordPress.
-Nesses paths os listeners coletam normalmente, mas nenhum middleware roda — e a
-request sumiria da fila. Em site movimentado isso é boa parte do tráfego, e
-`admin-ajax.php` costuma ser onde a carga aparece primeiro.
+O Acorn chama `$kernel->bootstrap()` em toda request e **só depois** decide se
+entrega a request ao kernel. Em `registerRequestHandler()` ele devolve ao
+WordPress os paths que casam com `admin_url()`, `wp_login_url()`,
+`wp_registration_url()`, `rest_url()` ou terminam em `.php`. Nesses casos os
+listeners coletam normalmente, mas nenhum middleware roda — e a request sumiria
+da fila.
+
+Quais paths caem de fato nessa regra depende de como o servidor monta
+`SCRIPT_NAME`/`PATH_INFO`, então não confie na lista de cabeça: numa instalação
+Bedrock + FrankenPHP observamos `/wp-json/` caindo no fallback enquanto
+`admin-ajax.php` e `wp-cron.php` passavam pelo middleware normalmente. É por
+isso que toda mensagem carrega `capture_source` — é ele que diz qual mecanismo
+capturou, e é assim que se descobre a divisão real no seu ambiente.
 
 ```env
 SQS_TELEMETRY_FALLBACK_TO_SHUTDOWN=true
@@ -266,6 +274,37 @@ O resolver roda **uma vez por flush**, não por mensagem, durante o teardown da
 request — não deve lançar exceção nem fazer I/O. As chaves da própria mensagem
 vencem as do resolver, para que ele não consiga sobrescrever, por exemplo, a
 classe de uma exception.
+
+## Contrato da mensagem (para quem escreve o consumidor)
+
+Toda mensagem, de qualquer tipo, carrega este envelope:
+
+| Campo | Para quê |
+|---|---|
+| `message_id` | UUID único por mensagem. **Use para deduplicar.** |
+| `request_id` | UUID compartilhado por tudo que uma mesma request produziu. Use para correlacionar. |
+| `sampling_rate` | Probabilidade com que esta mensagem foi selecionada. **Use como peso.** |
+| `type` | `request`, `exception`, `command` ou `log`. |
+| `project` | Identificador da aplicação. |
+| `timestamp` | ISO 8601, gerado na aplicação. |
+
+Mais o que o `ContextResolver` do host acrescentar (tenant, ambiente, release).
+
+Duas armadilhas que esses campos existem para evitar:
+
+**O SQS entrega pelo menos uma vez.** A mesma mensagem pode chegar duas ou mais
+vezes — é comportamento normal, não falha. Além disso, quando o `drain`
+reenvia um lote após uma falha parcial, a mensagem vai para a fila de novo e
+ganha um `MessageId` novo do próprio SQS, então deduplicar pelo id do SQS não
+basta. Deduplique por `message_id`.
+
+**Contagem sem peso mente.** Com `sampling_rate` em `0.05`, cada request
+registrada representa vinte. "1.200 requests hoje" na verdade são ~24.000. O
+peso vem por mensagem, e não é constante: runs de console e requests promovidas
+por uma exception chegam com `sampling_rate` igual a `1.0`, porque foram
+capturadas com certeza e não por sorteio. Multiplicar essas por vinte inflaria
+a contagem de erros na mesma proporção. Percentis de latência calculados sobre
+a amostra são estatisticamente honestos sem ponderação; contagens não são.
 
 ## O que é capturado?
 

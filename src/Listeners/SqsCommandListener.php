@@ -52,6 +52,9 @@ class SqsCommandListener
         'event:clear',
         'optimize',
         'optimize:clear',
+        // Would feed itself: every drain run would spool a command entry for
+        // the drain, which the next run ships and replaces.
+        'sqs-telemetry:drain',
     ];
 
     public function __construct(SqsBuffer $buffer, TimelineContext $timelineContext)

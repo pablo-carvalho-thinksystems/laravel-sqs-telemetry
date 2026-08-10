@@ -11,9 +11,13 @@ use Illuminate\Http\Client\Events\ConnectionFailed;
 use Illuminate\Http\Client\Events\ResponseReceived;
 use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\ServiceProvider;
+use Pablocarvalho\SqsTelemetry\Console\DrainSpoolCommand;
+use Pablocarvalho\SqsTelemetry\Contracts\Transport;
 use Pablocarvalho\SqsTelemetry\Handlers\SqsExceptionHandler;
 use Pablocarvalho\SqsTelemetry\Listeners\SqsCommandListener;
+use Pablocarvalho\SqsTelemetry\Services\RedisSpoolTransport;
 use Pablocarvalho\SqsTelemetry\Services\ReportedExceptions;
+use Pablocarvalho\SqsTelemetry\Services\RequestIdentity;
 use Pablocarvalho\SqsTelemetry\Services\RequestSanitizer;
 use Pablocarvalho\SqsTelemetry\Services\Sampler;
 use Pablocarvalho\SqsTelemetry\Services\ServerRequestSnapshot;
@@ -41,9 +45,20 @@ class SqsTelemetryServiceProvider extends ServiceProvider
             return new SqsClientService();
         });
 
+        // Where a flush goes. `redis` keeps AWS out of the request entirely:
+        // the request pays a sub-millisecond local push and
+        // `sqs-telemetry:drain` ships to SQS out of band.
+        $this->app->singleton(Transport::class, function ($app) {
+            if (config('sqs-telemetry.transport', 'sqs') === 'redis') {
+                return $app->make(RedisSpoolTransport::class);
+            }
+
+            return $app->make(SqsClientService::class);
+        });
+
         // Bind the Memory Buffer as a Singleton so the Middleware and ExceptionHandler share the same instance
         $this->app->singleton(SqsBuffer::class, function ($app) {
-            return new SqsBuffer($app->make(SqsClientService::class));
+            return new SqsBuffer($app->make(Transport::class));
         });
 
         // Bind TimelineContext as a Singleton
@@ -67,6 +82,11 @@ class SqsTelemetryServiceProvider extends ServiceProvider
             return new RequestSanitizer();
         });
 
+        // Correlates every message a single request produced
+        $this->app->singleton(RequestIdentity::class, function ($app) {
+            return new RequestIdentity();
+        });
+
         $this->app->singleton(ServerRequestSnapshot::class, function ($app) {
             return new ServerRequestSnapshot(
                 $app->make(RequestSanitizer::class),
@@ -87,6 +107,8 @@ class SqsTelemetryServiceProvider extends ServiceProvider
             $this->publishes([
                 __DIR__ . '/../config/sqs-telemetry.php' => config_path('sqs-telemetry.php'),
             ], 'sqs-telemetry-config');
+
+            $this->commands([DrainSpoolCommand::class]);
         }
 
         // Register Timeline Listeners
@@ -148,10 +170,13 @@ class SqsTelemetryServiceProvider extends ServiceProvider
      *
      * Hosts that bootstrap the framework without routing through it leave the
      * middleware unused, and the request would go unrecorded even though every
-     * listener was active and collecting. Acorn hands `/wp-admin`, `/wp-json`,
-     * `wp-login.php` and any `.php` path back to WordPress after bootstrapping
-     * the kernel, which on a busy site is a large share of the traffic — and
-     * `admin-ajax.php` in particular is where load tends to show up first.
+     * listener was active and collecting. Acorn hands back the paths matching
+     * `admin_url()`, `rest_url()`, the login URLs or ending in `.php`, which on
+     * a busy WordPress site is a large share of the traffic.
+     *
+     * Entries produced here are marked `capture_source: shutdown`, since which
+     * paths land here rather than in the middleware depends on how the server
+     * builds `SCRIPT_NAME`/`PATH_INFO`.
      *
      * @return bool Whether an entry was recorded.
      */
@@ -180,8 +205,12 @@ class SqsTelemetryServiceProvider extends ServiceProvider
             }
 
             // Reuses the draw the listeners already made, so an unsampled
-            // request stays unsampled all the way through.
-            if (! $this->app->make(Sampler::class)->shouldRecord()) {
+            // request stays unsampled all the way through. Never shouldRecord()
+            // aqui: o terminating() já passou por flushBuffers() e resetou o
+            // Sampler, então shouldRecord() faria um SEGUNDO sorteio — e uma
+            // request que perdeu o primeiro poderia ganhar o segundo, inflando
+            // a taxa efetiva de p para p + (1-p)·p.
+            if (! $this->app->make(Sampler::class)->shouldRecordAtShutdown()) {
                 return false;
             }
 
@@ -248,6 +277,10 @@ class SqsTelemetryServiceProvider extends ServiceProvider
 
             if ($this->app->bound(ReportedExceptions::class)) {
                 $this->app->make(ReportedExceptions::class)->flush();
+            }
+
+            if ($this->app->bound(RequestIdentity::class)) {
+                $this->app->make(RequestIdentity::class)->reset();
             }
         } catch (Throwable $e) {
             // Telemetry must never take the host application down with it —

@@ -14,6 +14,27 @@ class Sampler
     protected $decision;
 
     /**
+     * Whether recording was forced rather than drawn.
+     *
+     * @var bool
+     */
+    protected $forced = false;
+
+    /**
+     * Decision as it stood when reset() last ran.
+     *
+     * In classic SAPI the provider's terminating() hook resets this singleton
+     * BEFORE the shutdown-function fallback asks whether the request was
+     * sampled. Without this memo the fallback would draw a second time, and a
+     * request that lost the first draw could win the second — inflating the
+     * effective rate from p to p + (1-p)·p and shipping "shutdown" captures
+     * for routes the middleware already saw.
+     *
+     * @var bool|null
+     */
+    protected $lastDecision;
+
+    /**
      * Whether this request should record telemetry.
      *
      * The draw happens once and is then reused, so every listener in a request
@@ -55,6 +76,30 @@ class Sampler
     }
 
     /**
+     * The decision that applied to the request that just ran — never a redraw.
+     *
+     * For the shutdown-time capture path only. Reuses the live decision when
+     * there is one, then the memo preserved by reset(), and only draws fresh
+     * when nothing ever asked during the request (a request with every
+     * listener disabled). On long-lived workers the shutdown path does not run
+     * per request, so the memo never crosses request boundaries there.
+     *
+     * @return bool
+     */
+    public function shouldRecordAtShutdown(): bool
+    {
+        if ($this->decision !== null) {
+            return $this->decision;
+        }
+
+        if ($this->lastDecision !== null) {
+            return $this->lastDecision;
+        }
+
+        return $this->shouldRecord();
+    }
+
+    /**
      * Whether an exception must be recorded even on an unsampled request.
      *
      * @return bool
@@ -83,6 +128,36 @@ class Sampler
     public function forceRecord(): void
     {
         $this->decision = true;
+        $this->forced = true;
+    }
+
+    /**
+     * Probability with which the current request was selected.
+     *
+     * Travels with every message so the consumer can weight counts: at a rate
+     * of 0.05 each recorded request stands for twenty. Getting this wrong in
+     * either direction produces a dashboard that lies — which is why it is
+     * reported per message rather than assumed to be the configured value.
+     *
+     * Returns 1.0 whenever selection was certain: console runs, and requests
+     * promoted by an exception. Weighting those by the sampling rate would
+     * inflate error counts twentyfold.
+     *
+     * @return float
+     */
+    public function effectiveRate(): float
+    {
+        if ($this->forced || $this->runningInConsole()) {
+            return 1.0;
+        }
+
+        $rate = (float) config('sqs-telemetry.sampling.rate', 1.0);
+
+        if ($rate >= 1.0) {
+            return 1.0;
+        }
+
+        return $rate <= 0.0 ? 0.0 : $rate;
     }
 
     /**
@@ -107,6 +182,11 @@ class Sampler
      */
     public function reset(): void
     {
+        if ($this->decision !== null) {
+            $this->lastDecision = $this->decision;
+        }
+
         $this->decision = null;
+        $this->forced = false;
     }
 }

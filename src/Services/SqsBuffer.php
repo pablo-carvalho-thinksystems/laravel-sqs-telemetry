@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Pablocarvalho\SqsTelemetry\Services;
 
 use Pablocarvalho\SqsTelemetry\Contracts\ContextResolver;
+use Pablocarvalho\SqsTelemetry\Contracts\Transport;
 use Throwable;
 
 class SqsBuffer
@@ -15,7 +16,9 @@ class SqsBuffer
     protected $messages = [];
 
     /**
-     * @var SqsClientService
+     * Where flushed batches go: straight to SQS, or to a local spool.
+     *
+     * @var Transport
      */
     protected $sqsClientService;
 
@@ -49,7 +52,7 @@ class SqsBuffer
      */
     protected $requestRecorded = false;
 
-    public function __construct(SqsClientService $sqsClientService)
+    public function __construct(Transport $sqsClientService)
     {
         $this->sqsClientService = $sqsClientService;
         $this->batchSize = (int) config('sqs-telemetry.batch_size', 10);
@@ -172,14 +175,16 @@ class SqsBuffer
         $this->messages = [];
         $this->logCount = 0;
 
-        $context = $this->resolveContext();
+        $context = array_merge($this->resolveContext(), $this->identity());
 
-        if ($context !== []) {
-            foreach ($messagesToSend as $index => $message) {
-                // Host context loses to the message's own keys: a resolver must
-                // not be able to overwrite the class of an exception.
-                $messagesToSend[$index] = array_merge($context, $message);
-            }
+        foreach ($messagesToSend as $index => $message) {
+            // Host context loses to the message's own keys: a resolver must
+            // not be able to overwrite the class of an exception.
+            $messagesToSend[$index] = array_merge(
+                $context,
+                ['message_id' => RequestIdentity::uuid4()],
+                $message
+            );
         }
 
         // Split into batches according to configured size (Max 10)
@@ -216,6 +221,34 @@ class SqsBuffer
         } catch (Throwable $e) {
             // Runs during teardown; a broken factory costs this one entry.
         }
+    }
+
+    /**
+     * Fields every consumer needs to count correctly.
+     *
+     * `request_id` correlates the messages a single request produced;
+     * `sampling_rate` is the weight each one carries. Resolved defensively —
+     * telemetry without them is still worth shipping.
+     *
+     * @return array<string, mixed>
+     */
+    protected function identity(): array
+    {
+        $identity = [];
+
+        try {
+            $identity['request_id'] = app(RequestIdentity::class)->id();
+        } catch (Throwable $e) {
+            // No correlation id for this flush.
+        }
+
+        try {
+            $identity['sampling_rate'] = app(Sampler::class)->effectiveRate();
+        } catch (Throwable $e) {
+            // Consumer will have to assume 1.0.
+        }
+
+        return $identity;
     }
 
     /**

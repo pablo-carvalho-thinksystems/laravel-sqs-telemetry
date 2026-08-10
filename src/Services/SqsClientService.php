@@ -6,9 +6,10 @@ namespace Pablocarvalho\SqsTelemetry\Services;
 
 use Aws\Sqs\SqsClient;
 use Illuminate\Support\Facades\Log;
+use Pablocarvalho\SqsTelemetry\Contracts\Transport;
 use Throwable;
 
-class SqsClientService
+class SqsClientService implements Transport
 {
     /**
      * @var SqsClient|null
@@ -62,6 +63,16 @@ class SqsClientService
                 'region'  => config('sqs-telemetry.aws.region', 'us-east-1'),
             ];
 
+            // The SDK resolves the endpoint from the region, not from the queue
+            // URL, so an SQS-compatible server (ElasticMQ, LocalStack) is only
+            // reachable by overriding it explicitly.
+            $endpoint = config('sqs-telemetry.aws.endpoint');
+
+            if (! empty($endpoint)) {
+                $config['endpoint'] = $endpoint;
+                $config['use_path_style_endpoint'] = true;
+            }
+
             $key = config('sqs-telemetry.aws.key');
             $secret = config('sqs-telemetry.aws.secret');
 
@@ -91,17 +102,44 @@ class SqsClientService
      */
     public function sendBatch(array $messages): void
     {
+        $failed = $this->send($messages);
+
+        if ($failed !== []) {
+            Log::error('SqsTelemetry: SQS rejected part of the batch', [
+                'rejected' => count($failed),
+                'of' => count($messages),
+                '__sqs_telemetry' => true,
+            ]);
+        }
+    }
+
+    /**
+     * Send messages, reporting the ones SQS would not take.
+     *
+     * `SendMessageBatch` answers 200 with a `Failed` list when individual
+     * entries are rejected — throttling, or an entry the service dislikes. The
+     * call does not throw, so ignoring the response loses those messages
+     * without a trace. Callers that can retry (the spool drainer) get them
+     * back; callers that cannot at least get a log line.
+     *
+     * @param array<int, array<string, mixed>> $messages
+     * @return array<int, array<string, mixed>> Messages that were not accepted.
+     */
+    public function send(array $messages): array
+    {
         // Check the payload first: an empty batch must not be a reason to build
         // the AWS client (see client()).
         if (empty($messages)) {
-            return;
+            return [];
         }
 
         $client = $this->client();
 
         if (!$client) {
-            return;
+            return [];
         }
+
+        $rejected = [];
 
         try {
             // SQS caps a SendMessageBatch call at 256 KB across every entry, so
@@ -112,32 +150,39 @@ class SqsClientService
 
             $entries = [];
             $bytes = 0;
+            $byEntryId = [];
 
             foreach ($messages as $index => $message) {
                 $body = $this->encodeWithinLimit($message, $maxBytes);
 
                 if ($body === null) {
+                    // Could not be encoded at any size; retrying will not help.
+                    $rejected[] = $message;
+
                     continue;
                 }
 
                 $size = strlen($body);
 
                 if ($entries !== [] && ($bytes + $size) > $maxBytes) {
-                    $this->dispatch($client, $entries);
+                    $rejected = array_merge($rejected, $this->dispatch($client, $entries, $byEntryId));
                     $entries = [];
+                    $byEntryId = [];
                     $bytes = 0;
                 }
 
                 // SQS requires a unique ID for each message in a batch
+                $entryId = 'msg_' . $index . '_' . uniqid();
                 $entries[] = [
-                    'Id' => 'msg_' . $index . '_' . uniqid(),
+                    'Id' => $entryId,
                     'MessageBody' => $body,
                 ];
+                $byEntryId[$entryId] = $message;
                 $bytes += $size;
             }
 
             if ($entries !== []) {
-                $this->dispatch($client, $entries);
+                $rejected = array_merge($rejected, $this->dispatch($client, $entries, $byEntryId));
             }
         } catch (Throwable $e) {
             // Fails gracefully so it doesn't crash the host application during terminating()
@@ -146,7 +191,12 @@ class SqsClientService
                 'batch_size' => count($messages),
                 '__sqs_telemetry' => true,
             ]);
+
+            // The whole call failed, so nothing in it arrived.
+            return $messages;
         }
+
+        return $rejected;
     }
 
     /**
@@ -156,12 +206,30 @@ class SqsClientService
      * @param array $entries
      * @return void
      */
-    protected function dispatch($client, array $entries): void
+    protected function dispatch($client, array $entries, array $byEntryId = []): array
     {
-        $client->sendMessageBatch([
+        $result = $client->sendMessageBatch([
             'QueueUrl' => $this->queueUrl,
             'Entries'  => $entries,
         ]);
+
+        $failed = $result['Failed'] ?? [];
+
+        if (! is_array($failed) || $failed === []) {
+            return [];
+        }
+
+        $rejected = [];
+
+        foreach ($failed as $failure) {
+            $id = $failure['Id'] ?? null;
+
+            if ($id !== null && isset($byEntryId[$id])) {
+                $rejected[] = $byEntryId[$id];
+            }
+        }
+
+        return $rejected;
     }
 
     /**

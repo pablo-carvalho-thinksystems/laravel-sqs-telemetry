@@ -31,11 +31,16 @@ return [
     | Here you may configure your AWS credentials. By default, it uses the
     | standard AWS environment variables, but you can override them here.
     |
+    | Set `endpoint` to point at an SQS-compatible server (ElasticMQ,
+    | LocalStack). The SDK resolves the endpoint from the region and ignores the
+    | queue URL's host, so local development needs this override.
+    |
     */
     'aws' => [
-        'key'    => env('AWS_ACCESS_KEY_ID'),
-        'secret' => env('AWS_SECRET_ACCESS_KEY'),
-        'region' => env('AWS_DEFAULT_REGION', 'us-east-1'),
+        'key'      => env('AWS_ACCESS_KEY_ID'),
+        'secret'   => env('AWS_SECRET_ACCESS_KEY'),
+        'region'   => env('AWS_DEFAULT_REGION', 'us-east-1'),
+        'endpoint' => env('SQS_TELEMETRY_ENDPOINT'),
     ],
 
     /*
@@ -60,6 +65,32 @@ return [
     |
     */
     'batch_size' => env('SQS_TELEMETRY_BATCH_SIZE', 10),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Transport
+    |--------------------------------------------------------------------------
+    |
+    | `sqs` ships from inside the request. The response is already flushed by
+    | then, so the user waits on nothing — but the PHP worker does, for the
+    | whole round trip to AWS. On a host with a fixed thread pool that is a hard
+    | throughput ceiling: ~550ms per flush against a remote region across eight
+    | threads caps the application at roughly fifteen requests per second.
+    |
+    | `redis` writes the batch to a local list instead, which costs well under a
+    | millisecond, and `sqs-telemetry:drain` moves it to SQS out of band. Use it
+    | anywhere throughput matters.
+    |
+    */
+    'transport' => env('SQS_TELEMETRY_TRANSPORT', 'sqs'),
+
+    'spool' => [
+        'connection' => env('SQS_TELEMETRY_SPOOL_CONNECTION', 'default'),
+        'key' => env('SQS_TELEMETRY_SPOOL_KEY', 'sqs-telemetry:spool'),
+        // Bounds the list so a dead drainer cannot exhaust Redis. Oldest go
+        // first, on the grounds that a backlog nobody shipped is stale anyway.
+        'max_length' => env('SQS_TELEMETRY_SPOOL_MAX_LENGTH', 100000),
+    ],
 
     /*
     |--------------------------------------------------------------------------
@@ -127,12 +158,16 @@ return [
     | during `terminating()` — after the real response exists.
     |
     | `fallback_to_shutdown` covers the other half of the same problem: hosts
-    | that bootstrap the framework and then never route through it. Acorn hands
-    | `/wp-admin`, `/wp-json`, `wp-login.php` and every `.php` path back to
-    | WordPress *after* bootstrapping the kernel, so listeners collect but no
-    | middleware ever runs and the request goes unrecorded. With this on, the
+    | that bootstrap the framework and then hand the request back without
+    | routing it. Acorn does that for paths matching `admin_url()`,
+    | `rest_url()`, the login URLs or ending in `.php`, so listeners collect but
+    | no middleware ever runs and the request goes unrecorded. With this on, the
     | request is reconstructed from PHP's superglobals at shutdown and marked
     | `capture_source: shutdown`.
+    |
+    | Which paths actually fall under that rule depends on how the server builds
+    | `SCRIPT_NAME`/`PATH_INFO` — read `capture_source` on real traffic rather
+    | than assuming.
     |
     | `finish_request_before_flush` releases the response to the client before
     | the SQS call, and applies only to that fallback path — when the kernel

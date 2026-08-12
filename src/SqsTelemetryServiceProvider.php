@@ -23,6 +23,7 @@ use Pablocarvalho\SqsTelemetry\Services\Sampler;
 use Pablocarvalho\SqsTelemetry\Services\ServerRequestSnapshot;
 use Pablocarvalho\SqsTelemetry\Services\SqsBuffer;
 use Pablocarvalho\SqsTelemetry\Services\SqsClientService;
+use Pablocarvalho\SqsTelemetry\Services\TelemetryLog;
 use Pablocarvalho\SqsTelemetry\Services\TimelineContext;
 use Throwable;
 
@@ -286,6 +287,10 @@ class SqsTelemetryServiceProvider extends ServiceProvider
             // Telemetry must never take the host application down with it —
             // least of all from a shutdown handler, where an exception would
             // surface as a fatal error after the response was already sent.
+            TelemetryLog::step('flush.error', [
+                'exception' => $e->getMessage(),
+                'hint' => 'excecao durante o flush do buffer — antes de tudo era engolida em silencio',
+            ], 'error');
         }
     }
 

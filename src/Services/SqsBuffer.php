@@ -166,6 +166,10 @@ class SqsBuffer
         $this->materializeDeferredRequest();
 
         if (empty($this->messages)) {
+            TelemetryLog::step('buffer.empty', [
+                'hint' => 'nada coletado nesta request (nao amostrada? middleware/shutdown nao capturou?)',
+            ]);
+
             return;
         }
 
@@ -174,6 +178,11 @@ class SqsBuffer
         $messagesToSend = $this->messages;
         $this->messages = [];
         $this->logCount = 0;
+
+        TelemetryLog::step('buffer.flush', [
+            'count' => count($messagesToSend),
+            'transport' => get_class($this->sqsClientService),
+        ]);
 
         $context = array_merge($this->resolveContext(), $this->identity());
 

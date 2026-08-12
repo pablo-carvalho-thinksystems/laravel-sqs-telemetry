@@ -57,6 +57,12 @@ class RedisSpoolTransport implements Transport
             // element that only fails later, in the drainer.
             $length = $connection->rpush($key, ...$payloads);
 
+            TelemetryLog::step('spool.push', [
+                'pushed' => count($payloads),
+                'spool_length' => $length,
+                'key' => $key,
+            ]);
+
             // Bound the spool so a drainer that has died cannot turn telemetry
             // into an out-of-memory incident. Keeps the newest entries.
             $max = (int) config('sqs-telemetry.spool.max_length', 100000);

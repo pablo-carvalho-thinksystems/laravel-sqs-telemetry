@@ -54,6 +54,16 @@ class SqsClientService implements Transport
 
         if (empty($this->queueUrl) || !config('sqs-telemetry.enabled', true)) {
             $this->client = null;
+
+            // Ponto cego classico: sem URL de fila ou desabilitado, o envio vira
+            // no-op — send() devolve [] e o drainer marca tudo como enviado,
+            // esvaziando o spool sem que nada chegue na fila.
+            TelemetryLog::step('sqs.client.skip', [
+                'reason' => empty($this->queueUrl) ? 'queue.url vazia' : 'enabled=false',
+                'queue_url_set' => ! empty($this->queueUrl),
+                'enabled' => (bool) config('sqs-telemetry.enabled', true),
+            ], 'warning');
+
             return null;
         }
 
@@ -84,9 +94,17 @@ class SqsClientService implements Transport
             }
 
             $this->client = new SqsClient($config);
+
+            TelemetryLog::step('sqs.client.ready', [
+                'region' => $config['region'],
+                'endpoint' => $config['endpoint'] ?? '(aws default)',
+                'has_credentials' => isset($config['credentials']),
+                'queue_url' => $this->queueUrl,
+            ]);
         } catch (Throwable $e) {
             Log::error('SqsTelemetry: Failed to initialize SQS Client', [
-                'exception' => $e->getMessage()
+                'exception' => $e->getMessage(),
+                '__sqs_telemetry' => true,
             ]);
             $this->client = null;
         }
@@ -133,9 +151,19 @@ class SqsClientService implements Transport
             return [];
         }
 
+        TelemetryLog::step('sqs.send.begin', [
+            'count' => count($messages),
+            'queue_url' => $this->queueUrl,
+        ]);
+
         $client = $this->client();
 
         if (!$client) {
+            TelemetryLog::step('sqs.send.no_client', [
+                'discarded' => count($messages),
+                'hint' => 'sem cliente SQS: mensagens NAO enviadas (queue.url vazia ou enabled=false)',
+            ], 'warning');
+
             return [];
         }
 
@@ -196,6 +224,11 @@ class SqsClientService implements Transport
             return $messages;
         }
 
+        TelemetryLog::step('sqs.send.done', [
+            'sent' => count($messages) - count($rejected),
+            'rejected' => count($rejected),
+        ]);
+
         return $rejected;
     }
 
@@ -222,6 +255,14 @@ class SqsClientService implements Transport
         $rejected = [];
 
         foreach ($failed as $failure) {
+            // O motivo real de o SQS recusar uma entrada (throttling, payload,
+            // permissao). Sem isto, uma rejeicao parcial some sem rastro.
+            TelemetryLog::step('sqs.batch.rejected', [
+                'code' => $failure['Code'] ?? null,
+                'message' => $failure['Message'] ?? null,
+                'sender_fault' => $failure['SenderFault'] ?? null,
+            ], 'warning');
+
             $id = $failure['Id'] ?? null;
 
             if ($id !== null && isset($byEntryId[$id])) {

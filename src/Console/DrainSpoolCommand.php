@@ -8,6 +8,7 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Redis;
 use Pablocarvalho\SqsTelemetry\Services\RedisSpoolTransport;
 use Pablocarvalho\SqsTelemetry\Services\SqsClientService;
+use Pablocarvalho\SqsTelemetry\Services\TelemetryLog;
 use Throwable;
 
 /**
@@ -49,6 +50,13 @@ class DrainSpoolCommand extends Command
 
         $shipped = 0;
 
+        TelemetryLog::step('drain.begin', [
+            'spool_length' => $connection->llen($key),
+            'key' => $key,
+            'limit' => $limit,
+            'daemon' => $daemon,
+        ]);
+
         do {
             $batch = $this->pop($connection, $key, $batchSize);
 
@@ -69,6 +77,12 @@ class DrainSpoolCommand extends Command
                 $rejected = $sqs->send($batch);
                 $shipped += count($batch) - count($rejected);
 
+                TelemetryLog::step('drain.batch', [
+                    'popped' => count($batch),
+                    'sent' => count($batch) - count($rejected),
+                    'rejected' => count($rejected),
+                ]);
+
                 if ($rejected !== []) {
                     $this->requeue($connection, $key, $rejected);
                     $this->error(sprintf(
@@ -77,6 +91,13 @@ class DrainSpoolCommand extends Command
                         count($batch)
                     ));
 
+                    TelemetryLog::step('drain.rejected', [
+                        'rejected' => count($rejected),
+                        'of' => count($batch),
+                        'requeued' => true,
+                        'hint' => 'SQS respondeu 200 mas recusou entradas — ver sqs.batch.rejected acima',
+                    ], 'warning');
+
                     return self::FAILURE;
                 }
             } catch (Throwable $e) {
@@ -84,6 +105,13 @@ class DrainSpoolCommand extends Command
                 // telemetry, then stop: retrying immediately would just spin.
                 $this->requeue($connection, $key, $batch);
                 $this->error('Falha ao enviar para o SQS: ' . $e->getMessage());
+
+                TelemetryLog::step('drain.error', [
+                    'exception' => $e->getMessage(),
+                    'batch_size' => count($batch),
+                    'requeued' => true,
+                    'hint' => 'falha de rede/credencial/permissao no envio ao SQS',
+                ], 'error');
 
                 return self::FAILURE;
             }
@@ -98,6 +126,12 @@ class DrainSpoolCommand extends Command
         if ($this->discarded > 0) {
             $this->warn("Descartadas por conteúdo ilegível: {$this->discarded}.");
         }
+
+        TelemetryLog::step('drain.done', [
+            'shipped' => $shipped,
+            'discarded_unreadable' => $this->discarded,
+            'spool_remaining' => $connection->llen($key),
+        ]);
 
         return self::SUCCESS;
     }

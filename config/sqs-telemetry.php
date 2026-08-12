@@ -14,6 +14,20 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Debug Logging (rastro por etapa)
+    |--------------------------------------------------------------------------
+    |
+    | Liga um log de diagnostico em cada transicao do pipeline
+    | (coleta -> buffer -> flush -> spool -> drain -> SQS). Use quando as
+    | mensagens param de chegar na fila e voce precisa saber ATE ONDE elas
+    | chegaram. Verboso (emite por request e por flush) — mantenha desligado em
+    | producao. Ligue com SQS_TELEMETRY_DEBUG=true no ambiente investigado.
+    |
+    */
+    'debug' => env('SQS_TELEMETRY_DEBUG', false),
+
+    /*
+    |--------------------------------------------------------------------------
     | Project Identifier
     |--------------------------------------------------------------------------
     |

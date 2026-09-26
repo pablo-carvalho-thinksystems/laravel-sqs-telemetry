@@ -15,6 +15,7 @@ use Pablocarvalho\SqsTelemetry\Console\DrainSpoolCommand;
 use Pablocarvalho\SqsTelemetry\Contracts\Transport;
 use Pablocarvalho\SqsTelemetry\Handlers\SqsExceptionHandler;
 use Pablocarvalho\SqsTelemetry\Listeners\SqsCommandListener;
+use Pablocarvalho\SqsTelemetry\Services\QueryBindingSanitizer;
 use Pablocarvalho\SqsTelemetry\Services\RedisSpoolTransport;
 use Pablocarvalho\SqsTelemetry\Services\ReportedExceptions;
 use Pablocarvalho\SqsTelemetry\Services\RequestIdentity;
@@ -65,6 +66,22 @@ class SqsTelemetryServiceProvider extends ServiceProvider
         // Bind TimelineContext as a Singleton
         $this->app->singleton(TimelineContext::class, function ($app) {
             return new TimelineContext();
+        });
+
+        // Built once: the patterns are compiled from config, not per query.
+        $this->app->singleton(QueryBindingSanitizer::class, function ($app) {
+            $redact = (array) config('sqs-telemetry.redact', []);
+            $tableColumns = (array) ($redact['table_columns'] ?? ['sessions' => ['id', 'payload']]);
+
+            $sessionTable = config('session.table');
+            if (is_string($sessionTable) && $sessionTable !== '' && ! isset($tableColumns[$sessionTable])) {
+                $tableColumns[$sessionTable] = ['id', 'payload'];
+            }
+
+            return new QueryBindingSanitizer(
+                (array) ($redact['columns'] ?? ['password', 'secret', 'token', 'api_key', 'cpf', 'cnpj']),
+                $tableColumns
+            );
         });
 
         // One sampling decision per request, shared by every listener
@@ -488,7 +505,7 @@ class SqsTelemetryServiceProvider extends ServiceProvider
     }
 
     /**
-     * Sanitize query bindings by redacting values for sensitive columns.
+     * Mask credential bindings, keep the rest (see QueryBindingSanitizer).
      *
      * @param string $sql
      * @param array $bindings
@@ -496,33 +513,7 @@ class SqsTelemetryServiceProvider extends ServiceProvider
      */
     protected function sanitizeBindings(string $sql, array $bindings): array
     {
-        $sensitivePattern = '/password|secret|token|api_key|cpf|cnpj/i';
-
-        // Try to extract column names from INSERT statements to match with bindings
-        if (preg_match('/\(([^)]+)\)\s*values/i', $sql, $matches)) {
-            $columns = array_map('trim', explode(',', str_replace('"', '', $matches[1])));
-
-            foreach ($bindings as $index => $value) {
-                if (isset($columns[$index]) && preg_match($sensitivePattern, $columns[$index])) {
-                    $bindings[$index] = '[REDACTED]';
-                }
-            }
-        }
-
-        // Also check for UPDATE SET assignments: SET column = ?
-        if (preg_match_all('/([\w"]+)\s*=\s*\?/i', $sql, $matches)) {
-            $columns = array_map(function ($col) {
-                return trim(str_replace('"', '', $col));
-            }, $matches[1]);
-
-            foreach ($columns as $index => $column) {
-                if (isset($bindings[$index]) && preg_match($sensitivePattern, $column)) {
-                    $bindings[$index] = '[REDACTED]';
-                }
-            }
-        }
-
-        return $bindings;
+        return $this->app->make(QueryBindingSanitizer::class)->sanitize($sql, $bindings);
     }
 
     /**

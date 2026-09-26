@@ -343,8 +343,34 @@ Cada request/command captura um timeline detalhado com:
 
 #### Sanitização de Bindings
 
-Campos sensíveis são automaticamente substituídos por `[REDACTED]`:
-- `password`, `secret`, `token`, `api_key`, `cpf`, `cnpj`
+Os parâmetros vão junto com cada query para que o consumidor consiga
+reexecutá-la (EXPLAIN, reescritas). **Só credenciais** são trocadas por
+`[REDACTED]`; todo o resto segue como está, inclusive em tabelas como `users`
+e `sessions`.
+
+Cada `?` é pareado com a coluna a que se refere, lida do próprio SQL: lista de
+colunas do `INSERT` (inclusive várias linhas), `col = ?` e demais operadores
+de comparação, `col in (?, ?)` e `col between ? and ?`. `?` dentro de literal
+e o `??` do jsonb não contam como parâmetro. Um `?` que não dá para parear
+mantém o valor.
+
+Mascarados por padrão (`config/sqs-telemetry.php`, chave `redact`):
+
+- qualquer coluna cujo nome **contém** `password`, `passwd`, `secret`,
+  `token` (cobre `remember_token`), `api_key`, `apikey`, `recovery_code`,
+  `cpf`, `cnpj`, `card_number`, `credit_card`, `cvv`;
+- na tabela de sessões (`sessions` e a de `session.table`), as colunas `id` e
+  `payload`: o id **é** a credencial do navegador, e o payload carrega o token
+  CSRF e o hash de login.
+
+Se o seu `config/sqs-telemetry.php` foi publicado antes da v1.3.2, ele não tem
+a chave `redact` — os padrões acima valem mesmo assim. Para acrescentar
+colunas, copie o bloco `redact` da config do pacote.
+
+> **Não filtre os parâmetros na aplicação.** Um `Transport` próprio que
+> apaga os `bindings` de tabelas inteiras deixa a query impossível de
+> reexecutar no consumidor. Se faltar alguma coluna sensível, acrescente-a em
+> `redact.columns` ou `redact.table_columns`.
 
 Exemplo de evento `db_query` no timeline:
 ```json

@@ -252,4 +252,32 @@ return [
         'exceptions'  => env('SQS_TELEMETRY_TIMELINE_EXCEPTIONS', true),
         'logs'        => env('SQS_TELEMETRY_TIMELINE_LOGS', true),
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Query Binding Redaction
+    |--------------------------------------------------------------------------
+    |
+    | Bindings are shipped so the consumer can re-run a query. Only values
+    | that are credentials are replaced by "[REDACTED]"; every other binding
+    | goes as-is, including those on tables like `users` or `sessions`.
+    |
+    | `columns`: a binding is masked when its column name CONTAINS any of these
+    | fragments (case-insensitive) — "token" covers remember_token, etc.
+    |
+    | `table_columns`: masked only on that table. The session row is the
+    | credential itself: its id authenticates a browser and its payload
+    | carries the CSRF token and the login hash. The table configured in
+    | `session.table` is added automatically.
+    |
+    */
+    'redact' => [
+        'columns' => [
+            'password', 'passwd', 'secret', 'token', 'api_key', 'apikey',
+            'recovery_code', 'cpf', 'cnpj', 'card_number', 'credit_card', 'cvv',
+        ],
+        'table_columns' => [
+            'sessions' => ['id', 'payload'],
+        ],
+    ],
 ];
